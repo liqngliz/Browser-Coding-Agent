@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>true</IsPackable>
+    <PackAsTool>true</PackAsTool>
+    <PackageId>BrowserCodingAgent</PackageId>
+    <ToolCommandName>browser-coding-agent</ToolCommandName>
+    <PlaywrightPlatform>all</PlaywrightPlatform>
+    <Version>0.1.0</Version>
+    <Description>OpenAI-compatible Minimal API chat completions server backed by Microsoft 365 Copilot using Playwright for .NET.</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/liqngliz/Browser-Coding-Agent</RepositoryUrl>
+    <NoWarn>$(NoWarn);NU5111</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\LICENSE" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Playwright" Version="1.63.0" />
+  </ItemGroup>
+
+</Project>
