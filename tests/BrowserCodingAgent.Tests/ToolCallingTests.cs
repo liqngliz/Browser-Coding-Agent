@@ -63,6 +63,15 @@ public class ToolCallingTests
     }
 
     [Fact]
+    public void BuildInstructions_UsesLfOnly()
+    {
+        var specs = ToolCalling.ParseDefinitions(Tools());
+
+        Assert.DoesNotContain('\r', ToolCalling.BuildInstructions(specs, "You must call at least one tool in this reply.", firstTurn: true));
+        Assert.DoesNotContain('\r', ToolCalling.BuildInstructions(specs, null, firstTurn: false));
+    }
+
+    [Fact]
     public void ParseReply_ToolCallFence_BecomesToolCallAndLeavesText()
     {
         var (text, calls) = ToolCalling.ParseReply(

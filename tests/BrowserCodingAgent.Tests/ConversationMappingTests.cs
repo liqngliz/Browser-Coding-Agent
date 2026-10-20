@@ -235,6 +235,6 @@ public class PromptReplacementsTests
             PromptReplacements.Load("/nonexistent/replacements.json", AppContext.BaseDirectory,
                 Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance));
 
-        Assert.Contains("/nonexistent/replacements.json", ex.Message);
+        Assert.Contains(Path.GetFullPath("/nonexistent/replacements.json"), ex.Message);
     }
 }

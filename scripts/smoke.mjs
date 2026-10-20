@@ -146,7 +146,8 @@ try {
       });
       let content = '';
       try { content = JSON.parse(chat.body).choices[0].message.content; } catch { /* reported below */ }
-      chat.status === 200 && content === `echo: ping ${token}` ? ok('chat completion round trip') : bad(`chat ${chat.status} ${chat.body}`);
+      // The echo also carries appendToPrompt from the bundled replacements.json
+      chat.status === 200 && content.startsWith(`echo: ping ${token}`) ? ok('chat completion round trip') : bad(`chat ${chat.status} ${chat.body}`);
 
       // Later turn, streamed: history is resent, only the newest user message reaches the page
       const streamed = await get(`${base}/v1/chat/completions`, {
@@ -167,7 +168,7 @@ try {
         text = events.filter(e => e !== '[DONE]').map(e => JSON.parse(e))
           .map(c => c.choices?.[0]?.delta?.content ?? '').join('');
       } catch { /* reported below */ }
-      streamed.status === 200 && events.at(-1) === '[DONE]' && text === `echo: pong ${token}`
+      streamed.status === 200 && events.at(-1) === '[DONE]' && text.startsWith(`echo: pong ${token}`) && !text.includes(`ping ${token}`)
         ? ok('streamed later turn sends only the new message')
         : bad(`stream ${streamed.status} text=${JSON.stringify(text)} ${streamed.body.slice(0, 300)}`);
     }

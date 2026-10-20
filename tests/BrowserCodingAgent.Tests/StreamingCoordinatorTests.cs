@@ -282,6 +282,19 @@ public class StreamingCoordinatorTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task CrlfPrompt_IsSubmittedWithLf()
+    {
+        // A textarea (and M365's editor) stores line breaks as \n; CRLF input used to fail the exact readback check
+        var (coordinator, page) = await CreateAsync();
+        var request = new ChatCompletionRequest("m365-active", new List<ChatMessageRequest?> { new("user", "line one\r\nline two") });
+
+        var result = await coordinator.ExecuteChatCompletionAsync(request, new DefaultHttpContext());
+
+        Assert.IsType<Microsoft.AspNetCore.Http.HttpResults.Ok<ChatCompletionResponse>>(result);
+        Assert.Equal("line one\nline two", await page.EvaluateAsync<string>("window.sent[0]"));
+    }
+
+    [Fact]
     public async Task LaterTurn_SendsOnlyNewMessage_WithoutNewChat()
     {
         var (coordinator, page) = await CreateAsync();

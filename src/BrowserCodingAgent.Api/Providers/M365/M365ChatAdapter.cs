@@ -131,6 +131,9 @@ public class M365ChatAdapter
     {
         clientCancellation.ThrowIfCancellationRequested();
 
+        // Editors store line breaks as \n, so CRLF text (Windows files, tool output) would never match on readback
+        promptText = promptText.Replace("\r\n", "\n").Replace('\r', '\n');
+
         // 1. Establish single monotonic deadline before any composer interaction
         var stopwatch = Stopwatch.StartNew();
 

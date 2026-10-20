@@ -158,3 +158,4 @@ vite.config.ts.timestamp-*
 
 bin/
 obj/
+.vscode/settings.json

@@ -77,42 +77,43 @@ public static class ToolCalling
     // Full instructions on the first turn of a chat; the M365 chat keeps them, later turns get the current tool names
     public static string BuildInstructions(IReadOnlyList<ToolSpec> tools, string? required, bool firstTurn)
     {
+        // Explicit \n: AppendLine would write \r\n on Windows
         var sb = new StringBuilder();
         if (firstTurn)
         {
-            sb.AppendLine("How this conversation works");
-            sb.AppendLine("You are connected to an application running on the user's computer. You cannot open the user's files or run " +
+            sb.Append("How this conversation works").Append('\n');
+            sb.Append("You are connected to an application running on the user's computer. You cannot open the user's files or run " +
                           "programs yourself, but the application can: when you write a tool call block, the application runs that tool " +
                           "on the user's computer and its next message contains the result. So never ask the user to upload, paste, or " +
                           "share files; request what you need with tool call blocks. Do not use your own code interpreter, sandbox, " +
-                          "or file storage for this task.");
-            sb.AppendLine();
-            sb.AppendLine("Write one fenced block per tool call, exactly in this form, with arguments as a JSON object that matches the tool's parameters:");
-            sb.AppendLine($"```{Fence}");
-            sb.AppendLine("{\"name\": \"<tool name>\", \"arguments\": {}}");
-            sb.AppendLine("```");
-            sb.AppendLine("For example:");
-            sb.AppendLine($"```{Fence}");
-            sb.AppendLine($"{{\"name\": \"{tools[0].Name}\", \"arguments\": {ExampleArguments(tools[0].ParametersJson)}}}");
-            sb.AppendLine("```");
-            sb.AppendLine("You may write a short explanation before the blocks. After the blocks, stop and wait for the results.");
-            sb.AppendLine("Instead of saying you cannot access a file or run a command, request it with a tool call block.");
-            sb.AppendLine();
-            sb.AppendLine("Available tools:");
+                          "or file storage for this task.").Append('\n');
+            sb.Append('\n');
+            sb.Append("Write one fenced block per tool call, exactly in this form, with arguments as a JSON object that matches the tool's parameters:").Append('\n');
+            sb.Append($"```{Fence}").Append('\n');
+            sb.Append("{\"name\": \"<tool name>\", \"arguments\": {}}").Append('\n');
+            sb.Append("```").Append('\n');
+            sb.Append("For example:").Append('\n');
+            sb.Append($"```{Fence}").Append('\n');
+            sb.Append($"{{\"name\": \"{tools[0].Name}\", \"arguments\": {ExampleArguments(tools[0].ParametersJson)}}}").Append('\n');
+            sb.Append("```").Append('\n');
+            sb.Append("You may write a short explanation before the blocks. After the blocks, stop and wait for the results.").Append('\n');
+            sb.Append("Instead of saying you cannot access a file or run a command, request it with a tool call block.").Append('\n');
+            sb.Append('\n');
+            sb.Append("Available tools:").Append('\n');
             foreach (var tool in tools)
             {
-                sb.AppendLine($"- {tool.Name}: {tool.Description?.Trim()}");
-                sb.AppendLine($"  Parameters (JSON schema): {tool.ParametersJson}");
+                sb.Append($"- {tool.Name}: {tool.Description?.Trim()}").Append('\n');
+                sb.Append($"  Parameters (JSON schema): {tool.ParametersJson}").Append('\n');
             }
         }
         else
         {
-            sb.AppendLine($"Tools available now: {string.Join(", ", tools.Select(t => t.Name))}. " +
-                          $"Request files, searches, and commands with ```{Fence} blocks as described earlier; do not ask the user to upload or paste anything.");
+            sb.Append($"Tools available now: {string.Join(", ", tools.Select(t => t.Name))}. " +
+                          $"Request files, searches, and commands with ```{Fence} blocks as described earlier; do not ask the user to upload or paste anything.").Append('\n');
         }
 
         if (required != null)
-            sb.AppendLine(required);
+            sb.Append(required).Append('\n');
 
         return sb.ToString().TrimEnd();
     }
