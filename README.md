@@ -124,6 +124,7 @@ Persistent profiles default to `~/.browser-coding-agent/profiles/<channel>` outs
   - client-side rewinds are not mirrored; revert files with git
 - **Content:** String content or array of `{"type": "text", "text": "..."}` parts.
 - **Streaming:** `stream: true` -> SSE `chat.completion.chunk` deltas, `data: [DONE]`, `: keep-alive` every 15s; `stream_options.include_usage` -> zero-valued usage chunk (M365 exposes no token counts). Errors after Send arrive as an in-stream `{"error": ...}` event.
-- **Parameters:** `n: 1` only; `response_format` -> HTTP 400. `tools`, `functions`, `temperature`, and other generation settings are ignored (logged); replies are plain text.
+- **Parameters:** `n: 1` only; `response_format` -> HTTP 400; legacy `functions`, `temperature`, and other generation settings are ignored (logged).
+- **Tool calling (emulated):** `tools` are described in the prompt as plain text; fenced call blocks in Copilot's reply come back as `tool_calls` with `finish_reason: "tool_calls"` (streamed as one `tool_calls` delta). `tool_choice`: `none` disables tools, `required` or a named function adds a must-call line. `tool` result messages are sent as `Result of <tool name>:`. Copilot web chat has no native function calling, so calls depend on Copilot following the format.
 - **Concurrency:** Single-request gate. Overlapping requests receive HTTP 409 Conflict.
 - **Turn recovery:** Uncertain submissions or timeouts require manual recovery before accepting new prompts.
