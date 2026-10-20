@@ -69,6 +69,10 @@ public class ChatOptions
     public string? SendButtonSelector { get; set; }
     public string? AssistantMessageSelector { get; set; }
     public string? StopGeneratingSelector { get; set; }
+    public string? NewChatSelector { get; set; }
+
+    // Prompt/reply replacement rules; default lookup ~/.browser-coding-agent/replacements.json, then the bundled file
+    public string? ReplacementsFile { get; set; }
 
     public void Validate()
     {

@@ -22,18 +22,23 @@ public class RequestCoordinator
     private readonly M365ChatAdapter _adapter;
     private readonly ChatOptions _chatOptions;
     private readonly ILogger<RequestCoordinator> _logger;
+    private readonly PromptReplacements _replacements;
     private readonly SemaphoreSlim _gate = new(1, 1);
+
+    private static readonly TimeSpan KeepAliveInterval = TimeSpan.FromSeconds(15);
 
     public RequestCoordinator(
         IBrowserSession browserSession,
         M365ChatAdapter adapter,
         IOptions<ChatOptions> chatOptions,
-        ILogger<RequestCoordinator> logger)
+        ILogger<RequestCoordinator> logger,
+        PromptReplacements? replacements = null)
     {
         _browserSession = browserSession;
         _adapter = adapter;
         _chatOptions = chatOptions.Value;
         _logger = logger;
+        _replacements = replacements ?? PromptReplacements.None;
     }
 
     public ChatTurnState CurrentState { get; private set; } = ChatTurnState.Idle;
@@ -67,7 +72,7 @@ public class RequestCoordinator
 
     public async Task<IResult> ExecuteChatCompletionAsync(ChatCompletionRequest request, HttpContext httpContext)
     {
-        // 1. Strict input validation before any browser interaction
+        // 1. Input validation before any browser interaction
         if (string.IsNullOrWhiteSpace(request.Model) ||
             !string.Equals(request.Model, _chatOptions.ModelAlias, StringComparison.OrdinalIgnoreCase))
         {
@@ -77,17 +82,6 @@ public class RequestCoordinator
                     "invalid_request_error",
                     "model",
                     "model_not_found")),
-                statusCode: StatusCodes.Status400BadRequest);
-        }
-
-        if (request.Stream.HasValue && request.Stream.Value)
-        {
-            return Results.Json(
-                new ErrorResponse(new ErrorDetail(
-                    "Streaming is not supported in the initial release. Set stream: false.",
-                    "invalid_request_error",
-                    "stream",
-                    "unsupported_parameter")),
                 statusCode: StatusCodes.Status400BadRequest);
         }
 
@@ -102,83 +96,49 @@ public class RequestCoordinator
                 statusCode: StatusCodes.Status400BadRequest);
         }
 
-        if (request.Tools != null || request.Functions != null || request.ResponseFormat != null)
+        if (request.ResponseFormat != null)
         {
             return Results.Json(
                 new ErrorResponse(new ErrorDetail(
-                    "Tools, functions, and structured output formatting are not supported in this release.",
+                    "Structured output formatting (response_format) is not supported.",
                     "invalid_request_error",
-                    null,
+                    "response_format",
                     "unsupported_feature")),
                 statusCode: StatusCodes.Status400BadRequest);
         }
 
-        if (request.AdditionalProperties != null && request.AdditionalProperties.Count > 0)
+        // Tools are emulated in text (see ToolCalling); legacy "functions" is not supported and is ignored
+        IReadOnlyList<ToolSpec> tools;
+        try
         {
-            var firstUnsupported = request.AdditionalProperties.Keys.First();
+            tools = ToolCalling.ParseDefinitions(request.Tools);
+        }
+        catch (FormatException fex)
+        {
             return Results.Json(
-                new ErrorResponse(new ErrorDetail(
-                    $"Unsupported parameter '{firstUnsupported}'. Unsupported generation controls are rejected.",
-                    "invalid_request_error",
-                    firstUnsupported,
-                    "unsupported_parameter")),
+                new ErrorResponse(new ErrorDetail(fex.Message, "invalid_request_error", "tools", "invalid_tools")),
                 statusCode: StatusCodes.Status400BadRequest);
         }
 
-        if (request.Messages == null || request.Messages.Count != 1)
-        {
-            return Results.Json(
-                new ErrorResponse(new ErrorDetail(
-                    "Only a single new user message per request is supported. Conversation history is maintained in the active browser tab.",
-                    "invalid_request_error",
-                    "messages",
-                    "invalid_messages")),
-                statusCode: StatusCodes.Status400BadRequest);
-        }
+        var (toolsEnabled, requiredToolLine) = ToolCalling.ParseChoice(request.ToolChoice);
+        if (!toolsEnabled)
+            tools = Array.Empty<ToolSpec>();
 
-        var message = request.Messages[0];
-        if (message == null)
-        {
-            return Results.Json(
-                new ErrorResponse(new ErrorDetail(
-                    "Message entry cannot be null.",
-                    "invalid_request_error",
-                    "messages[0]",
-                    "invalid_messages")),
-                statusCode: StatusCodes.Status400BadRequest);
-        }
+        if (request.Functions != null)
+            _logger.LogWarning("Request includes legacy 'functions'; only 'tools' are supported, the reply is plain text.");
 
-        if (!string.Equals(message.Role, "user", StringComparison.OrdinalIgnoreCase))
-        {
-            return Results.Json(
-                new ErrorResponse(new ErrorDetail(
-                    $"Expected a user message, but found role '{message.Role}'.",
-                    "invalid_request_error",
-                    "messages[0].role",
-                    "invalid_role")),
-                statusCode: StatusCodes.Status400BadRequest);
-        }
+        if (request.AdditionalProperties is { Count: > 0 })
+            _logger.LogInformation("Ignoring unsupported parameters: {Parameters}", string.Join(", ", request.AdditionalProperties.Keys));
 
-        var textContent = message.ExtractTextContent(out var contentError);
-        if (contentError != null)
+        var (turn, mappingError) = ConversationMapper.Map(request.Messages);
+        if (mappingError != null)
         {
             return Results.Json(
                 new ErrorResponse(new ErrorDetail(
-                    contentError,
+                    mappingError.Message,
                     "invalid_request_error",
-                    "messages[0].content",
-                    "invalid_content")),
-                statusCode: StatusCodes.Status400BadRequest);
-        }
-
-        if (string.IsNullOrWhiteSpace(textContent))
-        {
-            return Results.Json(
-                new ErrorResponse(new ErrorDetail(
-                    "Message content cannot be empty.",
-                    "invalid_request_error",
-                    "messages[0].content",
-                    "empty_content")),
+                    mappingError.Param,
+                    mappingError.Code)),
                 statusCode: StatusCodes.Status400BadRequest);
         }
 
@@ -249,48 +209,135 @@ public class RequestCoordinator
             var timeout = TimeSpan.FromMinutes(_chatOptions.ResponseTimeoutMinutes);
             var page = _browserSession.ActivePage!;
 
+            // Streamed requests write the response here, inside the gate; headers go out once Send is clicked
+            var stream = request.Stream == true ? new SseChatStream(httpContext.Response, _chatOptions.ModelAlias) : null;
+            var emitter = new StreamingTextEmitter();
+            var sendDispatched = false;
+            using var keepAliveCts = new CancellationTokenSource();
+            var keepAlive = Task.CompletedTask;
+
+            async Task<IResult> Fail(int statusCode, ErrorResponse error)
+            {
+                if (stream == null || !sendDispatched)
+                    return Results.Json(error, statusCode: statusCode);
+
+                await keepAliveCts.CancelAsync();
+                await keepAlive;
+                await stream.WriteErrorAsync(error);
+                return Results.Empty;
+            }
+
             CurrentState = ChatTurnState.Submitting;
 
             try
             {
-                var answer = await _adapter.SendAndObserveAsync(
+                if (turn!.IsFirstTurn)
+                    await _adapter.StartNewChatAsync(page, httpContext.RequestAborted);
+
+                // First turn: preamble, then tool instructions, then the request (Copilot answers the request with
+                // the tools already in mind); later turns: the new messages, then a short reminder
+                var prompt = tools.Count == 0
+                    ? turn.Prompt
+                    : turn.IsFirstTurn
+                        ? string.Join("\n\n", new[] { turn.Preamble, ToolCalling.BuildInstructions(tools, requiredToolLine, firstTurn: true), $"Request:\n{turn.Input}" }
+                            .Where(p => !string.IsNullOrWhiteSpace(p)))
+                        : $"{turn.Input}\n\n{ToolCalling.BuildInstructions(tools, requiredToolLine, firstTurn: false)}";
+
+                var rawAnswer = await _adapter.SendAndObserveAsync(
                     page,
-                    textContent,
+                    _replacements.PrepareOutgoing(prompt),
                     timeout,
                     httpContext.RequestAborted,
                     onSendDispatched: () =>
                     {
                         CurrentState = ChatTurnState.Generating;
-                    });
+                        sendDispatched = true;
+                        if (stream != null)
+                            keepAlive = KeepAliveAsync(stream, keepAliveCts.Token);
+                    },
+                    onProgress: stream == null
+                        ? null
+                        : async snapshot =>
+                        {
+                            var visible = _replacements.ApplyIncoming(snapshot);
+                            if (tools.Count > 0)
+                                visible = ToolCalling.VisiblePrefix(visible);
+
+                            var delta = emitter.Next(visible);
+                            if (delta.Length > 0)
+                                await stream.WriteDeltaAsync(delta);
+                        });
 
                 CurrentState = ChatTurnState.Idle;
                 RecoveryReason = null;
+                var answer = _replacements.ApplyIncoming(rawAnswer);
 
-                var response = new ChatCompletionResponse(
-                    Id: $"chatcmpl-{Guid.NewGuid():N}",
-                    Object: "chat.completion",
-                    Created: DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                    Model: _chatOptions.ModelAlias,
-                    Choices: new List<ChatChoice>
-                    {
-                        new(
-                            Index: 0,
-                            Message: new ChatMessage("assistant", answer),
-                            FinishReason: "stop")
-                    });
+                var toolCalls = new List<ToolCall>();
+                if (tools.Count > 0)
+                {
+                    (answer, toolCalls) = ToolCalling.ParseReply(answer, tools.Select(t => t.Name).ToHashSet(StringComparer.Ordinal));
+                    if (toolCalls.Count > 0)
+                        _logger.LogInformation("Reply contains {Count} tool call(s): {Names}",
+                            toolCalls.Count, string.Join(", ", toolCalls.Select(c => c.Function.Name)));
+                }
 
-                return Results.Ok(response);
+                var finishReason = toolCalls.Count > 0 ? "tool_calls" : "stop";
+
+                if (stream == null)
+                {
+                    var content = answer.Trim();
+                    var response = new ChatCompletionResponse(
+                        Id: $"chatcmpl-{Guid.NewGuid():N}",
+                        Object: "chat.completion",
+                        Created: DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                        Model: _chatOptions.ModelAlias,
+                        Choices: new List<ChatChoice>
+                        {
+                            new(
+                                Index: 0,
+                                Message: new ChatMessage(
+                                    "assistant",
+                                    content.Length == 0 && toolCalls.Count > 0 ? null : content,
+                                    toolCalls.Count > 0 ? toolCalls : null),
+                                FinishReason: finishReason)
+                        });
+
+                    return Results.Ok(response);
+                }
+
+                await keepAliveCts.CancelAsync();
+                await keepAlive;
+
+                // Untrimmed, so it still extends what was streamed
+                var rest = emitter.Complete(answer);
+                if (emitter.FinalMismatch)
+                    _logger.LogWarning("Final answer does not extend the streamed text; the client received a truncated answer ({Streamed} of {Total} chars).",
+                        emitter.Emitted.Length, answer.Length);
+                if (rest.TrimEnd().Length > 0)
+                    await stream.WriteDeltaAsync(rest.TrimEnd());
+
+                if (toolCalls.Count > 0)
+                    await stream.WriteToolCallsAsync(toolCalls);
+
+                await stream.WriteFinishAsync(finishReason);
+                if (request.StreamOptions?.IncludeUsage == true)
+                    await stream.WriteUsageAsync();
+                await stream.WriteDoneAsync();
+
+                if (stream.ClientGone)
+                    _logger.LogWarning("Client disconnected during streaming; the browser turn completed anyway.");
+
+                return Results.Empty;
             }
             catch (OperationCanceledException) when (httpContext.RequestAborted.IsCancellationRequested && CurrentState == ChatTurnState.Submitting)
             {
                 CurrentState = ChatTurnState.Idle;
-                return Results.Json(
+                return await Fail(StatusCodes.Status400BadRequest,
                     new ErrorResponse(new ErrorDetail(
                         "Client cancelled request before submission.",
                         "invalid_request_error",
                         null,
-                        "request_cancelled")),
-                    statusCode: StatusCodes.Status400BadRequest);
+                        "request_cancelled")));
             }
             catch (TimeoutException tex)
             {
@@ -305,13 +352,12 @@ public class RequestCoordinator
                 }
 
                 _logger.LogWarning(tex, "Deadline expired waiting for browser answer.");
-                return Results.Json(
+                return await Fail(StatusCodes.Status504GatewayTimeout,
                     new ErrorResponse(new ErrorDetail(
                         tex.Message,
                         "timeout_error",
                         null,
-                        "deadline_exceeded")),
-                    statusCode: StatusCodes.Status504GatewayTimeout);
+                        "deadline_exceeded")));
             }
             catch (UpstreamUiException uex)
             {
@@ -326,13 +372,12 @@ public class RequestCoordinator
                 }
 
                 _logger.LogError(uex, "Upstream UI reported error: {Message}", uex.Message);
-                return Results.Json(
+                return await Fail(StatusCodes.Status502BadGateway,
                     new ErrorResponse(new ErrorDetail(
                         $"Upstream error from Copilot UI: {uex.Message}",
                         "api_error",
                         null,
-                        "upstream_error")),
-                    statusCode: StatusCodes.Status502BadGateway);
+                        "upstream_error")));
             }
             catch (InvalidOperationException iex)
             {
@@ -347,13 +392,12 @@ public class RequestCoordinator
                 }
 
                 _logger.LogWarning(iex, "Invalid operation during chat interaction: {Message}", iex.Message);
-                return Results.Json(
+                return await Fail(StatusCodes.Status409Conflict,
                     new ErrorResponse(new ErrorDetail(
                         iex.Message,
                         "conflict_error",
                         null,
-                        "invalid_operation")),
-                    statusCode: StatusCodes.Status409Conflict);
+                        "invalid_operation")));
             }
             catch (Exception ex)
             {
@@ -368,18 +412,39 @@ public class RequestCoordinator
                 }
 
                 _logger.LogError(ex, "Unexpected error in chat completion: {Message}", ex.Message);
-                return Results.Json(
+                return await Fail(StatusCodes.Status500InternalServerError,
                     new ErrorResponse(new ErrorDetail(
                         ex.Message,
                         "api_error",
                         null,
-                        "internal_error")),
-                    statusCode: StatusCodes.Status500InternalServerError);
+                        "internal_error")));
+            }
+            finally
+            {
+                await keepAliveCts.CancelAsync();
+                await keepAlive;
             }
         }
         finally
         {
             _gate.Release();
+        }
+    }
+
+    // Comment lines keep proxies and clients from closing an idle stream while M365 is still thinking
+    private static async Task KeepAliveAsync(SseChatStream stream, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await stream.StartAsync();
+            while (true)
+            {
+                await Task.Delay(KeepAliveInterval, cancellationToken);
+                await stream.WriteKeepAliveAsync();
+            }
+        }
+        catch (OperationCanceledException)
+        {
         }
     }
 }

@@ -393,4 +393,107 @@ public class SimulatedChatTests : IAsyncLifetime
         Assert.False(ready);
         Assert.Contains("currently generating", reason);
     }
+
+    [Fact]
+    public async Task SendAndObserveAsync_VirtualizedFeed_DetectsNewReplyWhenCountStaysFlat()
+    {
+        var page = await _browser!.NewPageAsync();
+        var html = @"
+<!DOCTYPE html>
+<html>
+<body>
+  <div id='feed'>
+    <div data-testid='markdown-reply' data-message-id='m1' aria-hidden='false'><p>old one</p></div>
+    <div data-testid='markdown-reply' data-message-id='m2' aria-hidden='false'><p>old two</p></div>
+    <div data-testid='markdown-reply' data-message-id='m3' aria-hidden='false'><p>old three</p></div>
+    <div data-testid='markdown-reply' data-message-id='m4' aria-hidden='false'><p>old four</p></div>
+  </div>
+  <textarea placeholder='Ask Microsoft 365 Copilot'></textarea>
+  <button aria-label='Submit message'>Send</button>
+  <button aria-label='Stop generating' style='display:none'>Stop</button>
+  <script>
+    const feed = document.getElementById('feed');
+    const stop = document.querySelector(""button[aria-label='Stop generating']"");
+    document.querySelector(""button[aria-label='Submit message']"").addEventListener('click', () => {
+      document.querySelector('textarea').value = '';
+      // Virtualizer: the oldest reply leaves the DOM as the new one arrives, so the count stays at 4
+      feed.firstElementChild.remove();
+      const reply = document.createElement('div');
+      reply.setAttribute('data-testid', 'markdown-reply');
+      reply.setAttribute('aria-hidden', 'true');
+      feed.append(reply);
+      stop.style.display = 'inline-block';
+      setTimeout(() => {
+        reply.innerHTML = '<p>NEW ANSWER</p>';
+        reply.setAttribute('data-message-id', 'm5');
+        reply.setAttribute('aria-hidden', 'false');
+        stop.style.display = 'none';
+      }, 400);
+    });
+  </script>
+</body>
+</html>";
+        await page.SetContentAsync(html);
+
+        var adapter = CreateAdapter();
+        var result = await adapter.SendAndObserveAsync(page, "Next question", TimeSpan.FromSeconds(20), CancellationToken.None);
+
+        Assert.Equal("NEW ANSWER", result);
+    }
+
+    [Fact]
+    public async Task CheckPageReadyAsync_WhenDailyLimitReached_ReturnsNotReady()
+    {
+        var page = await _browser!.NewPageAsync();
+        var html = @"
+<!DOCTYPE html>
+<html>
+<body>
+  <div role='status'>You've reached your daily limit<br>Get more usage now or check back at 2:00am</div>
+  <textarea placeholder='Ask Microsoft 365 Copilot'></textarea>
+  <button aria-label='Submit message'>Send</button>
+</body>
+</html>";
+        await page.SetContentAsync(html);
+
+        var adapter = CreateAdapter();
+        var (ready, reason) = await adapter.CheckPageReadyAsync(page);
+
+        Assert.False(ready);
+        Assert.Contains("usage limit reached", reason);
+        Assert.Contains("check back at 2:00am", reason);
+    }
+
+    [Fact]
+    public async Task SendAndObserveAsync_WhenDailyLimitShownAfterSend_ThrowsUpstreamUiExceptionWithoutWaiting()
+    {
+        var page = await _browser!.NewPageAsync();
+        var html = @"
+<!DOCTYPE html>
+<html>
+<body>
+  <div id='messages'></div>
+  <textarea placeholder='Ask Microsoft 365 Copilot'></textarea>
+  <button aria-label='Submit message'>Send</button>
+  <script>
+    document.querySelector(""button[aria-label='Submit message']"").addEventListener('click', () => {
+      document.querySelector('textarea').value = '';
+      const banner = document.createElement('div');
+      banner.setAttribute('role', 'status');
+      banner.innerText = ""You've reached your daily limit. Get more usage now or check back at 2:00am"";
+      document.body.append(banner);
+    });
+  </script>
+</body>
+</html>";
+        await page.SetContentAsync(html);
+
+        var adapter = CreateAdapter();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var ex = await Assert.ThrowsAsync<UpstreamUiException>(() =>
+            adapter.SendAndObserveAsync(page, "Test prompt", TimeSpan.FromMinutes(1), CancellationToken.None));
+
+        Assert.Contains("daily limit", ex.Message);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10), $"Took {sw.Elapsed.TotalSeconds:F1}s; expected an immediate failure.");
+    }
 }

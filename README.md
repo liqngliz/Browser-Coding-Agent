@@ -89,6 +89,18 @@ Default `appsettings.json`:
 }
 ```
 
+### Prompt replacements
+
+`replacements.json` rewrites prompts before they reach Copilot and maps reversible rules back in replies. Default rules target Cline's system prompt (`You are Cline, an AI coding agent.`, `<user_input mode="...">`, `<mode_notice>`, `<env>`), whose persona and wrapper tags trip Copilot's guardrails.
+
+| Field | Meaning |
+| --- | --- |
+| `find` / `replace` | text, or .NET regex when `regex: true` (`$1` = group) |
+| `wholeWord` | default `true`; `Cline` does not match inside `decline` |
+| `reverse` | map `replace` back to `find` in replies (plain text only) |
+
+Lookup order: `Chat:ReplacementsFile` -> `~/.browser-coding-agent/replacements.json` -> bundled default (`src/BrowserCodingAgent.Api/replacements.json`). Restart to reload. Startup fails on invalid JSON or regex.
+
 Persistent profiles default to `~/.browser-coding-agent/profiles/<channel>` outside package caches, keeping manual sign-in between restarts. Override with `Browser:UserDataDirectory` if desired.
 
 ## Endpoints
@@ -99,12 +111,19 @@ Persistent profiles default to `~/.browser-coding-agent/profiles/<channel>` outs
 | `/v1/models` | `GET` | Returns list containing configured alias (`m365-active`) |
 | `/health/live` | `GET` | Reports if server process is running |
 | `/health/ready` | `GET` | Reports if browser, tab, and composer are idle and ready (503 when busy or recovery needed) |
+| `/swagger` | `GET` | Swagger UI, with Cline and OpenCode setup values for this server's URL and model |
+| `/openapi/v1.json` | `GET` | OpenAPI 3.1 document |
 
 ## Supported API subset and limitations
 
 - **Model:** Must match configured `Chat:ModelAlias` (`m365-active`).
-- **Messages:** Single user message per request. Multi-turn history is managed directly within the active browser tab.
+- **Messages:** roles `system`, `developer`, `user`, `assistant`, `tool`. Roll-forward mapping onto the M365 tab:
+  - no `assistant` message yet (first turn) -> new M365 chat, prompt = system text + user message, joined by blank lines
+  - otherwise -> only the messages after the last `assistant` message (`user` and `tool` content, joined by blank lines)
+  - no role tags added: Copilot's guardrails refuse prompts wrapped in `<system>` ("it looks like I can't chat about this"); client content is sent unchanged
+  - client-side rewinds are not mirrored; revert files with git
 - **Content:** String content or array of `{"type": "text", "text": "..."}` parts.
-- **Parameters:** `stream: false`, `n: 1`. Unsupported parameters (temperature, tools, streaming) return HTTP 400 with OpenAI error envelopes.
+- **Streaming:** `stream: true` -> SSE `chat.completion.chunk` deltas, `data: [DONE]`, `: keep-alive` every 15s; `stream_options.include_usage` -> zero-valued usage chunk (M365 exposes no token counts). Errors after Send arrive as an in-stream `{"error": ...}` event.
+- **Parameters:** `n: 1` only; `response_format` -> HTTP 400. `tools`, `functions`, `temperature`, and other generation settings are ignored (logged); replies are plain text.
 - **Concurrency:** Single-request gate. Overlapping requests receive HTTP 409 Conflict.
 - **Turn recovery:** Uncertain submissions or timeouts require manual recovery before accepting new prompts.

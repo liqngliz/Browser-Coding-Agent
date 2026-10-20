@@ -24,6 +24,9 @@ public class BrowserSession : IBrowserSession, IHostedService
     private readonly ILogger<BrowserSession> _logger;
     private readonly SemaphoreSlim _initLock = new(1, 1);
 
+    private const int ProfileInUseAttempts = 30; // a stopping instance can hold the profile while it finishes an in-flight turn
+    private static readonly TimeSpan ProfileInUseRetryDelay = TimeSpan.FromSeconds(1);
+
     private IPlaywright? _playwright;
     private IBrowserContext? _context;
     private IPage? _activePage;
@@ -79,7 +82,7 @@ public class BrowserSession : IBrowserSession, IHostedService
                 Args = new[] { "--disable-blink-features=AutomationControlled" }
             };
 
-            _context = await _playwright.Chromium.LaunchPersistentContextAsync(userDataDir, options);
+            _context = await LaunchPersistentContextAsync(_playwright, userDataDir, options, cancellationToken);
             _context.Close += (_, _) =>
             {
                 _logger.LogWarning("Browser context was closed.");
@@ -246,6 +249,49 @@ public class BrowserSession : IBrowserSession, IHostedService
         await StopAsync(CancellationToken.None);
         _initLock.Dispose();
         GC.SuppressFinalize(this);
+    }
+
+    // Chrome allows one process per profile. A previous run's browser (e.g. debugger restart) may still be exiting.
+    private async Task<IBrowserContext> LaunchPersistentContextAsync(
+        IPlaywright playwright,
+        string userDataDir,
+        BrowserTypeLaunchPersistentContextOptions options,
+        CancellationToken cancellationToken)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return await playwright.Chromium.LaunchPersistentContextAsync(userDataDir, options);
+            }
+            catch (PlaywrightException ex) when (ex.Message.Contains("existing browser session", StringComparison.OrdinalIgnoreCase))
+            {
+                if (attempt >= ProfileInUseAttempts)
+                    throw new InvalidOperationException(DescribeProfileInUse(userDataDir), ex);
+
+                _logger.LogWarning("Browser profile {UserDataDir} is in use by another browser process; retrying ({Attempt}/{MaxAttempts}).",
+                    userDataDir, attempt, ProfileInUseAttempts);
+                await Task.Delay(ProfileInUseRetryDelay, cancellationToken);
+            }
+        }
+    }
+
+    private static string DescribeProfileInUse(string userDataDir)
+    {
+        // macOS/Linux: SingletonLock is a symlink to "<hostname>-<pid>"
+        string? owner = null;
+        try
+        {
+            var target = new FileInfo(Path.Combine(userDataDir, "SingletonLock")).LinkTarget;
+            if (target != null && int.TryParse(target[(target.LastIndexOf('-') + 1)..], out var pid))
+                owner = $" (PID {pid})";
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+
+        return $"Browser profile '{userDataDir}' is already in use by another browser process{owner}. " +
+               "Close that browser or stop the other browser-coding-agent instance, " +
+               "or set Browser:UserDataDirectory to a different profile.";
     }
 
     private string GetTargetHost()

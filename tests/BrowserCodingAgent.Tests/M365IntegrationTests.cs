@@ -8,6 +8,7 @@ using Microsoft.Extensions.Options;
 
 namespace BrowserCodingAgent.Tests;
 
+[Collection("M365Live")]
 public class M365IntegrationTests
 {
     private const bool SkipLocal = false;

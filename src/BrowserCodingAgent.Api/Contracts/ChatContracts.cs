@@ -46,8 +46,24 @@ public class ChatCompletionRequest
     [JsonPropertyName("response_format")]
     public object? ResponseFormat { get; set; }
 
+    [JsonPropertyName("stream_options")]
+    public StreamOptionsRequest? StreamOptions { get; set; }
+
+    // "auto" | "none" | "required" | {"type":"function","function":{"name":...}}
+    [JsonPropertyName("tool_choice")]
+    public JsonElement? ToolChoice { get; set; }
+
+    [JsonPropertyName("parallel_tool_calls")]
+    public bool? ParallelToolCalls { get; set; }
+
     [JsonExtensionData]
     public Dictionary<string, JsonElement>? AdditionalProperties { get; set; }
+}
+
+public class StreamOptionsRequest
+{
+    [JsonPropertyName("include_usage")]
+    public bool? IncludeUsage { get; set; }
 }
 
 public class ChatMessageRequest
@@ -68,6 +84,13 @@ public class ChatMessageRequest
 
     [JsonPropertyName("content")]
     public JsonElement Content { get; set; }
+
+    // Assistant messages: calls the model made; tool messages: which call this result answers
+    [JsonPropertyName("tool_calls")]
+    public List<ToolCall>? ToolCalls { get; set; }
+
+    [JsonPropertyName("tool_call_id")]
+    public string? ToolCallId { get; set; }
 
     public string? ExtractTextContent(out string? error)
     {
@@ -121,7 +144,27 @@ public class ChatMessageRequest
 
 public record ChatMessage(
     [property: JsonPropertyName("role")] string Role,
-    [property: JsonPropertyName("content")] string? Content
+    [property: JsonPropertyName("content")] string? Content,
+    [property: JsonPropertyName("tool_calls")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<ToolCall>? ToolCalls = null
+);
+
+public record ToolCall(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("type")] string Type,
+    [property: JsonPropertyName("function")] ToolCallFunction Function
+);
+
+public record ToolCallFunction(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("arguments")] string Arguments
+);
+
+public record ToolCallDelta(
+    [property: JsonPropertyName("index")] int Index,
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("type")] string Type,
+    [property: JsonPropertyName("function")] ToolCallFunction Function
 );
 
 public record ChatCompletionResponse(
@@ -136,6 +179,35 @@ public record ChatChoice(
     [property: JsonPropertyName("index")] int Index,
     [property: JsonPropertyName("message")] ChatMessage Message,
     [property: JsonPropertyName("finish_reason")] string FinishReason
+);
+
+public record ChatCompletionChunk(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("object")] string Object,
+    [property: JsonPropertyName("created")] long Created,
+    [property: JsonPropertyName("model")] string Model,
+    [property: JsonPropertyName("choices")] List<ChatChunkChoice> Choices,
+    [property: JsonPropertyName("usage")] ChatUsage? Usage = null
+);
+
+public record ChatChunkChoice(
+    [property: JsonPropertyName("index")] int Index,
+    [property: JsonPropertyName("delta")] ChatDelta Delta,
+    [property: JsonPropertyName("finish_reason")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? FinishReason
+);
+
+public record ChatDelta(
+    [property: JsonPropertyName("role")] string? Role = null,
+    [property: JsonPropertyName("content")] string? Content = null,
+    [property: JsonPropertyName("tool_calls")] List<ToolCallDelta>? ToolCalls = null
+);
+
+// M365 exposes no token counts
+public record ChatUsage(
+    [property: JsonPropertyName("prompt_tokens")] int PromptTokens = 0,
+    [property: JsonPropertyName("completion_tokens")] int CompletionTokens = 0,
+    [property: JsonPropertyName("total_tokens")] int TotalTokens = 0
 );
 
 public record ModelsResponse(

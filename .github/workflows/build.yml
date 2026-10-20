@@ -82,6 +82,7 @@ jobs:
               tools/net10.0/any/DotnetToolSettings.xml \
               tools/net10.0/any/BrowserCodingAgent.Api.dll \
               tools/net10.0/any/BrowserCodingAgent.Api.runtimeconfig.json \
+              tools/net10.0/any/replacements.json \
               tools/net10.0/any/Microsoft.Playwright.dll \
               tools/net10.0/any/.playwright/package/cli.js \
               tools/net10.0/any/.playwright/node/LICENSE \

@@ -147,6 +147,29 @@ try {
       let content = '';
       try { content = JSON.parse(chat.body).choices[0].message.content; } catch { /* reported below */ }
       chat.status === 200 && content === `echo: ping ${token}` ? ok('chat completion round trip') : bad(`chat ${chat.status} ${chat.body}`);
+
+      // Later turn, streamed: history is resent, only the newest user message reaches the page
+      const streamed = await get(`${base}/v1/chat/completions`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, timeoutMs: 90000,
+        body: JSON.stringify({
+          model: 'm365-active', stream: true, stream_options: { include_usage: true }, temperature: 0,
+          messages: [
+            { role: 'system', content: 'Be terse.' },
+            { role: 'user', content: `ping ${token}` },
+            { role: 'assistant', content: content },
+            { role: 'user', content: `pong ${token}` },
+          ],
+        }),
+      });
+      const events = streamed.body.split('\n\n').filter(e => e.startsWith('data: ')).map(e => e.slice(6));
+      let text = '';
+      try {
+        text = events.filter(e => e !== '[DONE]').map(e => JSON.parse(e))
+          .map(c => c.choices?.[0]?.delta?.content ?? '').join('');
+      } catch { /* reported below */ }
+      streamed.status === 200 && events.at(-1) === '[DONE]' && text === `echo: pong ${token}`
+        ? ok('streamed later turn sends only the new message')
+        : bad(`stream ${streamed.status} text=${JSON.stringify(text)} ${streamed.body.slice(0, 300)}`);
     }
   }
 

@@ -146,20 +146,21 @@ public class EndpointsTests : IClassFixture<WebApplicationFactory<Program>>
     }
 
     [Fact]
-    public async Task PostChatCompletions_UnsupportedTemperature_Returns400()
+    public async Task PostChatCompletions_UnknownGenerationParameters_AreIgnored()
     {
         var client = _factory.CreateClient();
         var content = new StringContent(
-            "{\"model\":\"m365-active\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"temperature\":0}",
+            "{\"model\":\"m365-active\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"temperature\":0,\"max_tokens\":100,\"stream_options\":{\"include_usage\":true}}",
             Encoding.UTF8,
             "application/json");
 
         var response = await client.PostAsync("/v1/chat/completions", content);
-        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        // Passes validation; reaches browser readiness check (503 because browser AutoStart is false)
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
 
         var body = await response.Content.ReadFromJsonAsync<ErrorResponse>();
         Assert.NotNull(body);
-        Assert.Equal("unsupported_parameter", body.Error.Code);
+        Assert.Equal("browser_not_ready", body.Error.Code);
     }
 
     [Theory]
@@ -217,7 +218,7 @@ public class EndpointsTests : IClassFixture<WebApplicationFactory<Program>>
     }
 
     [Fact]
-    public async Task PostChatCompletions_StreamingRequested_Returns400WithOpenAiError()
+    public async Task PostChatCompletions_StreamingBeforeSend_ReturnsJsonError()
     {
         var client = _factory.CreateClient();
         var request = new ChatCompletionRequest(
@@ -226,16 +227,16 @@ public class EndpointsTests : IClassFixture<WebApplicationFactory<Program>>
             stream: true);
 
         var response = await client.PostAsJsonAsync("/v1/chat/completions", request);
-        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        // Failures before Send is clicked keep their status code and JSON body, even for stream: true
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
 
         var body = await response.Content.ReadFromJsonAsync<ErrorResponse>();
         Assert.NotNull(body);
-        Assert.Equal("invalid_request_error", body.Error.Type);
-        Assert.Equal("unsupported_parameter", body.Error.Code);
+        Assert.Equal("browser_not_ready", body.Error.Code);
     }
 
     [Fact]
-    public async Task PostChatCompletions_MultipleMessages_Returns400WithOpenAiError()
+    public async Task PostChatCompletions_SystemAndHistory_AreAccepted()
     {
         var client = _factory.CreateClient();
         var request = new ChatCompletionRequest(
@@ -243,16 +244,34 @@ public class EndpointsTests : IClassFixture<WebApplicationFactory<Program>>
             new List<ChatMessageRequest?>
             {
                 new("system", "You are an assistant."),
-                new("user", "Hello")
-            });
+                new("user", "Hello"),
+                new("assistant", "Hi"),
+                new("user", "Next")
+            },
+            tools: new[] { new { type = "function", function = new { name = "read_file" } } });
+
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", request);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+
+        var body = await response.Content.ReadFromJsonAsync<ErrorResponse>();
+        Assert.NotNull(body);
+        Assert.Equal("browser_not_ready", body.Error.Code);
+    }
+
+    [Fact]
+    public async Task PostChatCompletions_EndsWithAssistantMessage_Returns400()
+    {
+        var client = _factory.CreateClient();
+        var request = new ChatCompletionRequest(
+            "m365-active",
+            new List<ChatMessageRequest?> { new("user", "Hello"), new("assistant", "Hi") });
 
         var response = await client.PostAsJsonAsync("/v1/chat/completions", request);
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
 
         var body = await response.Content.ReadFromJsonAsync<ErrorResponse>();
         Assert.NotNull(body);
-        Assert.Equal("invalid_request_error", body.Error.Type);
-        Assert.Equal("invalid_messages", body.Error.Code);
+        Assert.Equal("no_new_message", body.Error.Code);
     }
 
     [Fact]
@@ -269,5 +288,41 @@ public class EndpointsTests : IClassFixture<WebApplicationFactory<Program>>
         var body = await response.Content.ReadFromJsonAsync<ErrorResponse>();
         Assert.NotNull(body);
         Assert.Equal("empty_content", body.Error.Code);
+    }
+
+    [Fact]
+    public async Task GetOpenApiDocument_ListsAllEndpoints()
+    {
+        var client = _factory.CreateClient();
+        var response = await client.GetAsync("/openapi/v1.json");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.Contains("/v1/chat/completions", body);
+        Assert.Contains("/v1/models", body);
+        Assert.Contains("/health/live", body);
+        Assert.Contains("/health/ready", body);
+    }
+
+    [Fact]
+    public async Task GetOpenApiDocument_DescribesClientSetup()
+    {
+        var client = _factory.CreateClient();
+        var body = await client.GetStringAsync("/openapi/v1.json");
+
+        Assert.Contains("Cline", body);
+        Assert.Contains("opencode.json", body);
+        Assert.Contains("/v1", body);
+        Assert.Contains("browser-coding-agent/m365-active", body);
+    }
+
+    [Fact]
+    public async Task GetSwaggerUi_ReturnsHtml()
+    {
+        var client = _factory.CreateClient();
+        var response = await client.GetAsync("/swagger/index.html");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("text/html", response.Content.Headers.ContentType?.MediaType);
     }
 }

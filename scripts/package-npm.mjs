@@ -37,7 +37,7 @@ const files = new Map(report.files.map(f => [f.path.replaceAll('\\', '/'), f]));
 const required = [
   'package.json', 'browser-coding-agent.cjs', 'README.md', 'LICENSE',
   'app/BrowserCodingAgent.Api.dll', 'app/BrowserCodingAgent.Api.deps.json',
-  'app/BrowserCodingAgent.Api.runtimeconfig.json', 'app/appsettings.json', 'app/Microsoft.Playwright.dll',
+  'app/BrowserCodingAgent.Api.runtimeconfig.json', 'app/appsettings.json', 'app/replacements.json', 'app/Microsoft.Playwright.dll',
   'app/.playwright/package/cli.js', 'app/.playwright/node/LICENSE',
   'app/.playwright/node/darwin-arm64/node', 'app/.playwright/node/darwin-x64/node', 'app/.playwright/node/win32_x64/node.exe',
 ];
