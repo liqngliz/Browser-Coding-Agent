@@ -1,0 +1,214 @@
+name: build
+
+# Reusable: test, pack both distributions once, smoke-test the exact artifacts.
+# Called by ci.yml and release.yml. Publishes nothing.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: SemVer applied to assembly, .nupkg and npm package
+        required: true
+        type: string
+      retention-days:
+        type: number
+        default: 7
+
+permissions:
+  contents: read
+
+env:
+  VERSION: ${{ inputs.version }}
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build
+        shell: bash
+        run: dotnet build -c Release -p:Version="$VERSION"
+
+      # SimulatedChatTests launch Playwright's bundled Chromium, not an installed channel
+      - name: Install Playwright Chromium
+        shell: pwsh
+        run: tests/BrowserCodingAgent.Tests/bin/Release/net10.0/playwright.ps1 install --with-deps chromium
+
+      - name: Test
+        run: dotnet test -c Release --no-build --filter "Category!=ManualLiveValidation" --logger trx --results-directory TestResults
+
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-results-${{ matrix.os }}
+          path: TestResults
+          retention-days: ${{ inputs.retention-days }}
+
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Pack .NET tool
+        run: dotnet pack src/BrowserCodingAgent.Api -c Release -o artifacts/nuget -p:Version="$VERSION"
+
+      - name: Inspect .nupkg
+        run: |
+          nupkg="artifacts/nuget/BrowserCodingAgent.$VERSION.nupkg"
+          listing=$(unzip -Z1 "$nupkg")
+          for entry in LICENSE README.md \
+              tools/net10.0/any/DotnetToolSettings.xml \
+              tools/net10.0/any/BrowserCodingAgent.Api.dll \
+              tools/net10.0/any/BrowserCodingAgent.Api.runtimeconfig.json \
+              tools/net10.0/any/Microsoft.Playwright.dll \
+              tools/net10.0/any/.playwright/package/cli.js \
+              tools/net10.0/any/.playwright/node/LICENSE \
+              tools/net10.0/any/.playwright/node/darwin-arm64/node \
+              tools/net10.0/any/.playwright/node/darwin-x64/node \
+              tools/net10.0/any/.playwright/node/win32_x64/node.exe; do
+            grep -qxF "$entry" <<<"$listing" || { echo "::error::$nupkg missing $entry"; exit 1; }
+          done
+          size=$(stat -c %s "$nupkg")
+          echo "$nupkg: $((size / 1024 / 1024)) MB"
+          # nuget.org rejects packages over 250 MB
+          [ "$size" -lt $((250 * 1024 * 1024)) ] || { echo "::error::$nupkg exceeds nuget.org 250 MB limit"; exit 1; }
+
+      - name: Pack npm package
+        run: node scripts/package-npm.mjs --version "$VERSION"
+
+      - name: Checksums
+        working-directory: artifacts
+        run: sha256sum nuget/*.nupkg npm/*.tgz | tee SHA256SUMS
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: packages
+          path: |
+            artifacts/nuget
+            artifacts/npm
+            artifacts/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: ${{ inputs.retention-days }}
+
+  smoke:
+    needs: pack
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Log directory
+        run: echo "SMOKE_LOG_DIR=$RUNNER_TEMP/smoke-logs" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: packages
+          path: artifacts
+
+      - name: Verify checksums
+        working-directory: artifacts
+        run: if command -v sha256sum >/dev/null; then sha256sum -c SHA256SUMS; else shasum -a 256 -c SHA256SUMS; fi
+
+      # Headless installed Chrome against a fake chat page; real M365 stays manual
+      - name: Smoke .NET tool from local feed
+        run: |
+          dotnet tool install BrowserCodingAgent --tool-path "$RUNNER_TEMP/tool" \
+            --add-source artifacts/nuget --version "$VERSION"
+          node scripts/smoke.mjs --tool "$RUNNER_TEMP/tool/browser-coding-agent"
+
+      - name: Smoke npm tarball (first run bootstraps runtime)
+        run: node scripts/smoke.mjs --npm artifacts/npm/*.tgz
+
+      - name: Smoke npm tarball (cached runtime)
+        run: node scripts/smoke.mjs --npm artifacts/npm/*.tgz --no-browser --timeout 90
+
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoke-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/smoke-logs
+          retention-days: ${{ inputs.retention-days }}
+
+  # No .NET anywhere: proves the launcher bootstraps its own runtime instead of finding one.
+  # Linux is outside the supported set, hence the override and no browser.
+  npm-clean:
+    needs: pack
+    runs-on: ubuntu-latest
+    container: node:22-bookworm-slim
+    defaults:
+      run:
+        shell: bash
+    env:
+      BROWSER_CODING_AGENT_ALLOW_UNSUPPORTED: '1'
+    steps:
+      # No git in the image: checkout falls back to the REST API, which cannot sparse-checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: packages
+          path: artifacts
+
+      - name: Verify checksums
+        working-directory: artifacts
+        run: sha256sum -c SHA256SUMS
+
+      # dotnet-install.sh needs curl; the runtime needs ICU
+      - name: Install native prerequisites
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libicu72
+
+      - name: Assert no .NET present
+        run: |
+          if command -v dotnet; then echo "::error::dotnet on PATH"; exit 1; fi
+          if [ -n "${DOTNET_ROOT:-}" ]; then echo "::error::DOTNET_ROOT=$DOTNET_ROOT"; exit 1; fi
+          for d in /usr/share/dotnet /usr/lib/dotnet /usr/local/share/dotnet "$HOME/.dotnet" "$HOME/.browser-coding-agent"; do
+            if [ -e "$d" ]; then echo "::error::$d exists"; exit 1; fi
+          done
+
+      - name: Smoke npm tarball (first run)
+        run: node scripts/smoke.mjs --npm artifacts/npm/*.tgz --no-browser
+
+      - name: Smoke npm tarball (cached runtime)
+        run: node scripts/smoke.mjs --npm artifacts/npm/*.tgz --no-browser --timeout 90
