@@ -192,6 +192,7 @@ public class M365ChatAdapter
 
         var initialUserCount = await GetUserMessageCountAsync(page);
         var submittedByEnter = false;
+        var stopSeenAtSend = false;
 
         // Waits up to Chat:SendEnableSeconds for an enabled Send (M365 needs ~3s after a fill; longer on a slow network).
         // At 10s (or half the wait) a still-disabled Send gets focus + Enter in the composer, which can submit on its
@@ -224,10 +225,14 @@ public class M365ChatAdapter
                     enterTried = true;
                     _logger.LogWarning("Send still disabled after {Seconds:F0}s; focusing the composer and pressing Enter.", waited.TotalSeconds);
                     var enterStarted = stopwatch.Elapsed;
-                    if (await PressEnterInComposerAsync(composer, GetRemainingBudgetMs()) &&
-                        await WaitForSubmissionAsync(page, composer, promptText, initialUserCount, initialAssistantCount,
-                            initialLatestReplyId, useReplyIds, conversationUrl, clientCancellation))
-                        return (null, seen, false, true);
+                    if (await PressEnterInComposerAsync(composer, GetRemainingBudgetMs()))
+                    {
+                        var (accepted, stopSeen) = await WaitForSubmissionAsync(page, composer, promptText, initialUserCount,
+                            initialAssistantCount, initialLatestReplyId, useReplyIds, conversationUrl, clientCancellation);
+                        stopSeenAtSend |= stopSeen;
+                        if (accepted)
+                            return (null, seen, false, true);
+                    }
                     enterSpent = stopwatch.Elapsed - enterStarted;
                     continue; // re-check Send right away: the key press itself can enable it
                 }
@@ -304,8 +309,10 @@ public class M365ChatAdapter
                     _logger.LogWarning("Send attempt {Attempt} failed: {Message}", sendAttempt, ex.Message.Split('\n')[0]);
                 }
 
-                if (await WaitForSubmissionAsync(page, composer, promptText, initialUserCount, initialAssistantCount,
-                        initialLatestReplyId, useReplyIds, conversationUrl, clientCancellation))
+                var (sendAccepted, stopVisible) = await WaitForSubmissionAsync(page, composer, promptText, initialUserCount,
+                    initialAssistantCount, initialLatestReplyId, useReplyIds, conversationUrl, clientCancellation);
+                stopSeenAtSend |= stopVisible;
+                if (sendAccepted)
                     break;
 
                 if (sendAttempt >= MaxSendAttempts)
@@ -331,7 +338,7 @@ public class M365ChatAdapter
         // 6. Watch answer with exponential backoff bounded by monotonic deadline
         var currentIntervalMs = 500;
         var maxIntervalMs = onProgress != null ? MaxStreamingPollIntervalMs : MaxPollIntervalMs;
-        var generationSeen = false;
+        var generationSeen = stopSeenAtSend;
         string? lastObservedText = null;
         var stableCount = 0;
         var observed = "no poll completed";
@@ -707,7 +714,9 @@ public class M365ChatAdapter
 
     // Accepted unless the composer still holds exactly the prompt with no other sign of submission. Other signs:
     // Stop shown, a new user message or reply, an error/limit banner (the observe loop reports it), another conversation
-    private async Task<bool> WaitForSubmissionAsync(
+    // StopSeen: Stop was visible at confirmation, which also counts as generation evidence (a fast reply can start
+    // and finish before the observe loop's first poll)
+    private async Task<(bool Accepted, bool StopSeen)> WaitForSubmissionAsync(
         IPage page, ILocator composer, string promptText, int initialUserCount, int initialAssistantCount,
         string? initialLatestReplyId, bool useReplyIds, string conversationUrl, CancellationToken cancellation)
     {
@@ -715,30 +724,30 @@ public class M365ChatAdapter
         while (stopwatch.Elapsed < SendConfirmWait)
         {
             if (page.IsClosed)
-                return false;
+                return (false, false);
 
             try
             {
-                if (!string.Equals(await GetComposerTextAsync(composer, 300), promptText.Trim(), StringComparison.Ordinal))
-                    return true; // emptied (or changed): the text left the composer
-
                 var (stop, _) = await FindFirstElementAsync(page, GetStopGeneratingSelectors(), 50);
                 if (stop != null)
-                    return true;
+                    return (true, true);
+
+                if (!string.Equals(await GetComposerTextAsync(composer, 300), promptText.Trim(), StringComparison.Ordinal))
+                    return (true, false); // emptied (or changed): the text left the composer
 
                 if (await GetUserMessageCountAsync(page) > initialUserCount)
-                    return true;
+                    return (true, false);
 
                 var replies = await GetAssistantMessageCountAsync(page);
                 if (useReplyIds ? replies > 0 && await GetLatestReplyIdAsync(page) != initialLatestReplyId : replies > initialAssistantCount)
-                    return true;
+                    return (true, false);
 
                 var (banner, _) = await FindFirstElementAsync(page, GetErrorBannerSelectors(), 50);
                 if (banner != null || await FindUsageLimitNoticeAsync(page) != null)
-                    return true;
+                    return (true, false);
 
                 if (!IsSamePage(conversationUrl, page.Url))
-                    return true;
+                    return (true, false);
             }
             catch (PlaywrightException)
             {
@@ -748,7 +757,7 @@ public class M365ChatAdapter
             await Task.Delay(200, cancellation);
         }
 
-        return false;
+        return (false, false);
     }
 
     // Click into the composer to focus it, put the caret at the end (a click lands mid-text, where Enter would only

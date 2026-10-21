@@ -608,6 +608,28 @@ public class SimulatedChatTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task SendAndObserveAsync_FastReply_StopSeenAtSendCountsAsGeneration()
+    {
+        // Stop shows for only 100ms (a fast reply on a slow machine): the observe loop's first poll can miss it
+        var page = await _browser!.NewPageAsync();
+        await page.SetContentAsync(SendPage(@"
+    sendBtn.addEventListener('click', () => {
+      window.processed++;
+      composer.value = '';
+      stopBtn.style.display = 'inline-block';
+      const turn = document.createElement('div');
+      turn.setAttribute('data-message-author', 'assistant');
+      turn.innerText = 'QUICK';
+      document.getElementById('messages').appendChild(turn);
+      setTimeout(() => { stopBtn.style.display = 'none'; }, 100);
+    });"));
+
+        var result = await CreateAdapter().SendAndObserveAsync(page, "Hello", TimeSpan.FromSeconds(20), CancellationToken.None);
+
+        Assert.Equal("QUICK", result);
+    }
+
+    [Fact]
     public async Task SendAndObserveAsync_NeverAccepted_FailsCleanly()
     {
         var page = await _browser!.NewPageAsync();
