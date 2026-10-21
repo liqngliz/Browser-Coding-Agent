@@ -67,6 +67,7 @@ Provenance is attached automatically (public repo + trusted publishing). It requ
    ```sh
    npm view @liqngliz/browser-coding-agent dist-tags
    dotnet package search BrowserCodingAgent --exact-match
+   dnx BrowserCodingAgent@<version>
    ```
    nuget.org indexing can lag the push by several minutes.
 
@@ -88,6 +89,18 @@ Version comes from the tag; `<Version>` in the csproj applies to local builds on
 | `publish-npm` | verifies `SHA256SUMS`, npm 11, `npm publish <tgz>` unless already published | `version`, `build` |
 
 Publish jobs consume the artifacts `build` tested; nothing is rebuilt. Only publish jobs get `id-token: write`.
+
+## Post-release smoke
+
+`post-release-smoke.yml` runs after every `release` run (also when npm failed) and on demand:
+
+| Job | Does |
+| --- | --- |
+| `version` | tag `v<semver>` of the release run, or the `version` input |
+| `wait-for-nuget` | polls `api.nuget.org/v3-flatcontainer/browsercodingagent/index.json` every 30s, up to 90 min (validation + indexing) |
+| `smoke` | windows, macOS arm64, macOS x64: `dotnet tool install` from nuget.org, installed version check, `scripts/smoke.mjs --channel msedge` (installed Edge, headless) |
+
+Manual run: Actions → post-release-smoke → Run workflow → version (e.g. `0.1.1`). Logs: `post-release-smoke-logs-<os>` artifact on failure.
 
 ## Partial failure and retry
 

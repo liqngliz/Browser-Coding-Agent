@@ -132,6 +132,11 @@ try {
     const models = await get(`${base}/v1/models`);
     models.status === 200 && models.body.includes('m365-active') ? ok('/v1/models lists m365-active') : bad(`/v1/models ${models.status} ${models.body}`);
 
+    const openapi = await get(`${base}/openapi/v1.json`);
+    openapi.status === 200 && openapi.body.includes('/v1/chat/completions') ? ok('/openapi/v1.json lists /v1/chat/completions') : bad(`/openapi/v1.json ${openapi.status}`);
+    const swagger = await get(`${base}/swagger/index.html`);
+    swagger.status === 200 && swagger.body.includes('swagger') ? ok('/swagger UI served') : bad(`/swagger/index.html ${swagger.status}`);
+
     if (opt['no-browser']) {
       const ready = await get(`${base}/health/ready`);
       ready.status === 503 && ready.body.includes('Browser is not running') ? ok('/health/ready 503 without browser') : bad(`/health/ready ${ready.status} ${ready.body}`);

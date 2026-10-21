@@ -60,8 +60,9 @@ node scripts/smoke.mjs --npm artifacts/npm/liqngliz-browser-coding-agent-0.0.0-l
 | `ci.yml` | PR, push to `main` | `build.yml` with version `0.0.0-ci.<run>` |
 | `build.yml` | called | tests (ubuntu/windows/macos), packs `.nupkg` + `.tgz` once, smoke-tests both on windows, macOS arm64, macOS x64, plus npm bootstrap in a container without .NET |
 | `release.yml` | tag `v<semver>` | `build.yml`, then publishes the tested artifacts to nuget.org and npm (`latest`, or `next` for prerelease tags) |
+| `post-release-smoke.yml` | after `release`, or manual | waits for nuget.org to serve the version, installs the tool from nuget.org, smoke-tests it with installed Edge on windows, macOS arm64, macOS x64 |
 
-Release: `git tag v0.1.0 && git push origin v0.1.0`. Publish jobs use the `release` environment and OIDC trusted publishing; no API keys are stored.
+Release: `git tag v0.1.0 && git push origin v0.1.0`. Run without installing: `dnx BrowserCodingAgent` (or `dnx BrowserCodingAgent@0.1.0`). Publish jobs use the `release` environment and OIDC trusted publishing; no API keys are stored.
 
 ## Running locally
 
