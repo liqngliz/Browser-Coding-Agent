@@ -295,6 +295,23 @@ public class StreamingCoordinatorTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task BomAndZeroWidthInPrompt_AreStrippedBeforeSubmit()
+    {
+        // Visual Studio saves .cs/.csproj with a BOM; Cline's file reads carry it into the prompt
+        var (coordinator, page) = await CreateAsync();
+        var request = new ChatCompletionRequest("m365-active", new List<ChatMessageRequest?>
+        {
+            new("user", "Result of read_files:\n\uFEFF<Project Sdk=\"Microsoft.NET.Sdk\">\n</Project>\nzero\u200Bwidth")
+        });
+
+        var result = await coordinator.ExecuteChatCompletionAsync(request, new DefaultHttpContext());
+
+        Assert.IsType<Microsoft.AspNetCore.Http.HttpResults.Ok<ChatCompletionResponse>>(result);
+        Assert.Equal("Result of read_files:\n<Project Sdk=\"Microsoft.NET.Sdk\">\n</Project>\nzerowidth",
+            await page.EvaluateAsync<string>("window.sent[0]"));
+    }
+
+    [Fact]
     public async Task LaterTurn_SendsOnlyNewMessage_WithoutNewChat()
     {
         var (coordinator, page) = await CreateAsync();

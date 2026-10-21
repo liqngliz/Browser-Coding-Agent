@@ -131,8 +131,10 @@ public class M365ChatAdapter
     {
         clientCancellation.ThrowIfCancellationRequested();
 
-        // Editors store line breaks as \n, so CRLF text (Windows files, tool output) would never match on readback
-        promptText = promptText.Replace("\r\n", "\n").Replace('\r', '\n');
+        // Editors store line breaks as \n, so CRLF text (Windows files, tool output) would never match on readback.
+        // The editor also drops zero-width characters and BOMs (Visual Studio saves .cs/.csproj with U+FEFF), and
+        // the readback strips them too, so the prompt must lose them as well or the comparison can never succeed.
+        promptText = StripInvisible(promptText.Replace("\r\n", "\n").Replace('\r', '\n'));
 
         // 1. Establish single monotonic deadline before any composer interaction
         var stopwatch = Stopwatch.StartNew();
@@ -172,54 +174,63 @@ public class M365ChatAdapter
         // M365 keeps Send disabled for a few seconds after the editor receives text, and a freshly loaded
         // (server-rendered) page can wipe the editor when its scripts attach: text that vanishes is filled again.
         ILocator? sendButton = null;
-        for (var attempt = 1; sendButton == null; attempt++)
+        try
         {
-            await composer.FillAsync(promptText, new LocatorFillOptions { Timeout = GetRemainingBudgetMs() });
-            var filledText = await GetComposerTextAsync(composer, Math.Min(500, GetRemainingBudgetMs()));
-            if (string.IsNullOrWhiteSpace(filledText))
-                throw new InvalidOperationException("Failed to populate prompt into composer.");
-            if (!string.Equals(filledText.Trim(), promptText.Trim(), StringComparison.Ordinal))
-                throw new InvalidOperationException("Populated prompt in composer does not match requested prompt.");
-
-            var sendSeen = false;
-            var wiped = false;
-            var sendEnableDeadline = stopwatch.Elapsed + SendEnableWait;
-            while (stopwatch.Elapsed < sendEnableDeadline)
+            for (var attempt = 1; sendButton == null; attempt++)
             {
-                var (candidate, _) = await FindFirstElementAsync(page, GetSendButtonSelectors(), Math.Min(250, GetRemainingBudgetMs()));
-                if (candidate != null)
+                await composer.FillAsync(promptText, new LocatorFillOptions { Timeout = GetRemainingBudgetMs() });
+                var filledText = await GetComposerTextAsync(composer, Math.Min(500, GetRemainingBudgetMs()));
+                if (string.IsNullOrWhiteSpace(filledText))
+                    throw new InvalidOperationException("Failed to populate prompt into composer.");
+                if (!string.Equals(filledText.Trim(), promptText.Trim(), StringComparison.Ordinal))
+                    throw new InvalidOperationException("Populated prompt in composer does not match requested prompt.");
+
+                var sendSeen = false;
+                var wiped = false;
+                var sendEnableDeadline = stopwatch.Elapsed + SendEnableWait;
+                while (stopwatch.Elapsed < sendEnableDeadline)
                 {
-                    sendSeen = true;
-                    if (await candidate.IsEnabledAsync())
+                    var (candidate, _) = await FindFirstElementAsync(page, GetSendButtonSelectors(), Math.Min(250, GetRemainingBudgetMs()));
+                    if (candidate != null)
                     {
-                        sendButton = candidate;
+                        sendSeen = true;
+                        if (await candidate.IsEnabledAsync())
+                        {
+                            sendButton = candidate;
+                            break;
+                        }
+                    }
+
+                    if (string.IsNullOrWhiteSpace(await GetComposerTextAsync(composer, Math.Min(500, GetRemainingBudgetMs()))))
+                    {
+                        wiped = true;
                         break;
                     }
+
+                    await Task.Delay((int)Math.Min(100, GetRemainingBudgetMs()), clientCancellation);
                 }
 
-                if (string.IsNullOrWhiteSpace(await GetComposerTextAsync(composer, Math.Min(500, GetRemainingBudgetMs()))))
-                {
-                    wiped = true;
+                if (sendButton != null)
                     break;
-                }
 
-                await Task.Delay((int)Math.Min(100, GetRemainingBudgetMs()), clientCancellation);
+                if (!wiped || attempt >= MaxFillAttempts)
+                    throw new InvalidOperationException(
+                        wiped ? $"Composer text was cleared by the page after {attempt} fill attempts."
+                        : sendSeen ? "Send button is disabled."
+                        : "Send button was not found or is not visible.");
+
+                _logger.LogWarning("Composer text was cleared after filling (page still initializing); filling again ({Attempt}/{MaxAttempts}).",
+                    attempt + 1, MaxFillAttempts);
             }
 
-            if (sendButton != null)
-                break;
-
-            if (!wiped || attempt >= MaxFillAttempts)
-                throw new InvalidOperationException(
-                    wiped ? $"Composer text was cleared by the page after {attempt} fill attempts."
-                    : sendSeen ? "Send button is disabled."
-                    : "Send button was not found or is not visible.");
-
-            _logger.LogWarning("Composer text was cleared after filling (page still initializing); filling again ({Attempt}/{MaxAttempts}).",
-                attempt + 1, MaxFillAttempts);
+            clientCancellation.ThrowIfCancellationRequested();
         }
-
-        clientCancellation.ThrowIfCancellationRequested();
+        catch
+        {
+            // Nothing was sent: leave an empty composer, or every later request fails readiness ("already contains text")
+            await ClearComposerQuietlyAsync(composer);
+            throw;
+        }
 
         // 5. Dispatch single Send click
         await sendButton.ClickAsync(new LocatorClickOptions
@@ -473,8 +484,25 @@ public class M365ChatAdapter
     }
 
     // The M365 editor appends zero-width markers (U+200B, U+200C) after typed text
-    private static string NormalizeComposerText(string? text) =>
-        new string((text ?? string.Empty).Where(c => c is not ('​' or '‌' or '‍' or '﻿')).ToArray()).Trim();
+    private static string NormalizeComposerText(string? text) => StripInvisible(text ?? string.Empty).Trim();
+
+    // U+200B/U+200C/U+200D (zero-width) and U+FEFF (BOM): the editor drops or appends them
+    private static string StripInvisible(string text) =>
+        new string(text.Where(c => c is not ('​' or '‌' or '‍' or '﻿')).ToArray());
+
+    private async Task ClearComposerQuietlyAsync(ILocator composer)
+    {
+        try
+        {
+            // Only when text was left behind; a disabled or empty composer needs nothing and must not stall the error
+            if (!string.IsNullOrWhiteSpace(await GetComposerTextAsync(composer, 500)))
+                await composer.FillAsync(string.Empty, new LocatorFillOptions { Timeout = 2000 });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not clear the composer after a failed submission attempt.");
+        }
+    }
 
     private static async Task<(ILocator? Locator, string? Selector)> FindFirstElementAsync(
         IPage page,

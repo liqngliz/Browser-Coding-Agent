@@ -480,6 +480,39 @@ public class SimulatedChatTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task SendAndObserveAsync_ReadbackMismatch_ClearsComposerAndDoesNotSend()
+    {
+        // An editor that rewrites input: readback never matches, so nothing may be sent and the composer must not stay filled
+        var page = await _browser!.NewPageAsync();
+        var html = @"
+<!DOCTYPE html>
+<html>
+<body>
+  <textarea placeholder='Ask Microsoft 365 Copilot'></textarea>
+  <button aria-label='Submit message'>Send</button>
+  <script>
+    window.sendClicked = false;
+    const composer = document.querySelector('textarea');
+    composer.addEventListener('input', () => { if (composer.value) composer.value = composer.value.toUpperCase(); });
+    document.querySelector(""button[aria-label='Submit message']"").addEventListener('click', () => { window.sendClicked = true; });
+  </script>
+</body>
+</html>";
+        await page.SetContentAsync(html);
+
+        var adapter = CreateAdapter();
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            adapter.SendAndObserveAsync(page, "lower case prompt", TimeSpan.FromSeconds(20), CancellationToken.None));
+
+        Assert.Contains("does not match", ex.Message);
+        Assert.False(await page.EvaluateAsync<bool>("window.sendClicked"));
+        Assert.Equal(string.Empty, await page.EvaluateAsync<string>("document.querySelector('textarea').value"));
+
+        var (ready, _) = await adapter.CheckPageReadyAsync(page);
+        Assert.True(ready);
+    }
+
+    [Fact]
     public async Task CheckPageReadyAsync_WhenDailyLimitReached_ReturnsNotReady()
     {
         var page = await _browser!.NewPageAsync();
