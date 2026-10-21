@@ -1,0 +1,14 @@
+{
+  "name": "@liqngliz/browser-coding-agent",
+  "version": "0.0.0",
+  "description": "OpenAI-compatible chat completions server backed by Microsoft 365 Copilot web chat via Playwright.",
+  "bin": { "browser-coding-agent": "browser-coding-agent.cjs" },
+  "files": ["browser-coding-agent.cjs", "app", "app/.playwright"],
+  "engines": { "node": ">=20" },
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "git+https://github.com/liqngliz/Browser-Coding-Agent.git" },
+  "homepage": "https://github.com/liqngliz/Browser-Coding-Agent#readme",
+  "bugs": { "url": "https://github.com/liqngliz/Browser-Coding-Agent/issues" },
+  "keywords": ["openai", "copilot", "m365", "playwright", "chat-completions", "proxy"],
+  "publishConfig": { "access": "public" }
+}
