@@ -311,6 +311,102 @@ public class StreamingCoordinatorTests : IAsyncLifetime
             await page.EvaluateAsync<string>("window.sent[0]"));
     }
 
+    // Composer truncates input at 8000 characters (like some M365 accounts); replies acknowledge parts, answer the last
+    private const string LimitedComposerPage = @"
+<!DOCTYPE html>
+<html>
+<body>
+  <div id='log'></div>
+  <textarea placeholder='Ask Microsoft 365 Copilot'></textarea>
+  <button aria-label='Send'>Send</button>
+  <button aria-label='Stop generating' style='display:none'>Stop</button>
+  <script>
+    window.sent = [];
+    const composer = document.querySelector('textarea');
+    composer.addEventListener('input', () => { if (composer.value.length > 8000) composer.value = composer.value.slice(0, 8000); });
+    const stop = document.querySelector(""button[aria-label='Stop generating']"");
+    document.querySelector(""button[aria-label='Send']"").addEventListener('click', () => {
+      const text = composer.value;
+      if (!text.trim()) return;
+      window.sent.push(text);
+      composer.value = '';
+      stop.style.display = 'inline-block';
+      const reply = document.createElement('div');
+      reply.setAttribute('data-testid', 'markdown-reply');
+      reply.setAttribute('aria-hidden', 'true');
+      document.getElementById('log').append(reply);
+      setTimeout(() => {
+        const ack = text.match(/^Part (\d+) of (\d+) of one long message/);
+        reply.innerHTML = '<p></p>';
+        reply.firstChild.textContent = ack ? 'received ' + ack[1] + '/' + ack[2] : 'FINAL ANSWER after ' + window.sent.length + ' messages';
+        reply.setAttribute('aria-hidden', 'false');
+        stop.style.display = 'none';
+      }, 200);
+    });
+  </script>
+</body>
+</html>";
+
+    private async Task<(RequestCoordinator Coordinator, IPage Page)> CreateLimitedAsync(int maxPromptChars)
+    {
+        var page = await _browser!.NewPageAsync();
+        await page.SetContentAsync(LimitedComposerPage);
+        var options = Options.Create(new ChatOptions { ModelAlias = "m365-active", ResponseTimeoutMinutes = 1, MaxPromptChars = maxPromptChars });
+        var adapter = new M365ChatAdapter(options, NullLogger<M365ChatAdapter>.Instance);
+        return (new RequestCoordinator(new PageBrowserSession(page), adapter, options, NullLogger<RequestCoordinator>.Instance), page);
+    }
+
+    private static string LongToolOutput(int chars)
+    {
+        var sb = new StringBuilder();
+        for (var i = 0; sb.Length < chars; i++)
+            sb.Append($"src/File{i:D5}.cs: public int Value{i} {{ get; set; }}\n");
+        return sb.ToString(0, chars);
+    }
+
+    private static string Unwrap(IEnumerable<string> sent) => string.Concat(sent.Select(p => p[(p.IndexOf("\n\n", StringComparison.Ordinal) + 2)..]));
+
+    [Fact]
+    public async Task ComposerTruncation_IsDetected_AndPromptIsResentInParts()
+    {
+        var (coordinator, page) = await CreateLimitedAsync(maxPromptChars: 0);
+        var prompt = "Result of read_files:\n" + LongToolOutput(20000);
+        var request = new ChatCompletionRequest("m365-active", new List<ChatMessageRequest?>
+        {
+            new("user", "First"), new("assistant", "Earlier reply"), new("user", prompt)
+        });
+
+        var result = await coordinator.ExecuteChatCompletionAsync(request, new DefaultHttpContext());
+
+        var ok = Assert.IsType<Microsoft.AspNetCore.Http.HttpResults.Ok<ChatCompletionResponse>>(result);
+        var sent = await page.EvaluateAsync<string[]>("window.sent");
+        Assert.True(sent.Length >= 3, $"expected at least 3 parts, got {sent.Length}");
+        Assert.All(sent, p => Assert.True(p.Length <= 8000, $"part has {p.Length} chars"));
+        Assert.StartsWith($"Part {sent.Length} of {sent.Length}. The message is complete.", sent[^1]);
+        Assert.Equal(prompt.TrimEnd(), Unwrap(sent)); // messages are trimmed before sending
+        Assert.Equal($"FINAL ANSWER after {sent.Length} messages", ok.Value!.Choices[0].Message.Content);
+        Assert.Equal(ChatTurnState.Idle, coordinator.CurrentState);
+    }
+
+    [Fact]
+    public async Task ConfiguredMaxPromptChars_ChunksWithoutTryingTheFullPrompt()
+    {
+        var (coordinator, page) = await CreateLimitedAsync(maxPromptChars: 3000);
+        var prompt = LongToolOutput(7000);
+        var request = new ChatCompletionRequest("m365-active", new List<ChatMessageRequest?>
+        {
+            new("user", "First"), new("assistant", "Earlier reply"), new("user", prompt)
+        });
+
+        var result = await coordinator.ExecuteChatCompletionAsync(request, new DefaultHttpContext());
+
+        Assert.IsType<Microsoft.AspNetCore.Http.HttpResults.Ok<ChatCompletionResponse>>(result);
+        var sent = await page.EvaluateAsync<string[]>("window.sent");
+        Assert.Equal(3, sent.Length);
+        Assert.All(sent, p => Assert.True(p.Length <= 3000, $"part has {p.Length} chars"));
+        Assert.Equal(prompt.TrimEnd(), Unwrap(sent)); // messages are trimmed before sending
+    }
+
     [Fact]
     public async Task LaterTurn_SendsOnlyNewMessage_WithoutNewChat()
     {

@@ -57,8 +57,11 @@ public class ToolCallingTests
         Assert.Contains("Do not use your own code interpreter", first);
         Assert.DoesNotContain("<", first.Replace("<tool name>", ""));
 
+        Assert.Contains("Never invent other tool names.", first);
+
         var later = ToolCalling.BuildInstructions(specs, "You must call at least one tool in this reply.", firstTurn: false);
-        Assert.StartsWith("Tools available now: read_files, run_commands.", later);
+        Assert.Contains("```tool_call\n{\"name\": \"<tool name>\", \"arguments\": {}}\n```", later);
+        Assert.Contains("use exactly these with these parameters: read_files(files), run_commands().", later);
         Assert.EndsWith("You must call at least one tool in this reply.", later);
     }
 
@@ -119,6 +122,50 @@ public class ToolCallingTests
 
         Assert.Empty(calls);
         Assert.Equal(reply, text);
+    }
+
+    [Fact]
+    public void ParseReply_LenientShapes_AreAccepted()
+    {
+        // Two objects in one block, trailing comma, a comment, OpenAI "function" wrapper, "parameters" key
+        var reply = "```tool_call\n" +
+                    "{\"name\": \"read_files\", \"arguments\": {\"files\": [\"/a\"],},}\n" +
+                    "// second call\n" +
+                    "{\"type\": \"function\", \"function\": {\"name\": \"run_commands\", \"parameters\": {\"commands\": [\"ls\"]}}}\n" +
+                    "```";
+
+        var (text, calls) = ToolCalling.ParseReply(reply, Names, out var rejected);
+
+        Assert.Empty(rejected);
+        Assert.Equal(string.Empty, text.Trim());
+        Assert.Equal(new[] { "read_files", "run_commands" }, calls.Select(c => c.Function.Name));
+        Assert.Equal("{\"files\":[\"/a\"]}", calls[0].Function.Arguments);
+        Assert.Equal("{\"commands\":[\"ls\"]}", calls[1].Function.Arguments);
+    }
+
+    [Fact]
+    public void ParseReply_ReportsWhyCallLikeBlocksStayedText()
+    {
+        var reply = "```tool_call\n{\"name\": \"cmd\", \"arguments\": {}}\n```\n" +
+                    "```json\n{\"name\": \"read_files\", \"arguments\": {\n```\n" +
+                    "```csharp\nvar x = 1;\n```";
+
+        var (text, calls) = ToolCalling.ParseReply(reply, Names, out var rejected);
+
+        Assert.Empty(calls);
+        Assert.Equal(reply, text);
+        Assert.Equal(2, rejected.Count);
+        Assert.Equal("unknown tool 'cmd'", rejected[0]);
+        Assert.StartsWith("invalid JSON", rejected[1]);
+    }
+
+    [Fact]
+    public void Signature_MarksOptionalParameters()
+    {
+        var spec = new ToolSpec("editor", null,
+            "{\"type\":\"object\",\"properties\":{\"command\":{},\"path\":{},\"old_str\":{}},\"required\":[\"command\",\"path\"]}");
+
+        Assert.Equal("editor(command, path, old_str?)", ToolCalling.Signature(spec));
     }
 
     [Fact]

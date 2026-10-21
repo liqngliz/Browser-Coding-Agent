@@ -11,6 +11,20 @@ public class UpstreamUiException : Exception
     public UpstreamUiException(string message) : base(message) { }
 }
 
+// The composer refused the full prompt before anything was sent: it kept only a prefix (AcceptedLength), or Send
+// stayed disabled on a long prompt (AcceptedLength null). The caller can resend the prompt in chunks.
+public class PromptTooLongException : InvalidOperationException
+{
+    public PromptTooLongException(string message, int promptLength, int? acceptedLength) : base(message)
+    {
+        PromptLength = promptLength;
+        AcceptedLength = acceptedLength;
+    }
+
+    public int PromptLength { get; }
+    public int? AcceptedLength { get; }
+}
+
 public class M365ChatAdapter
 {
     private readonly ChatOptions _chatOptions;
@@ -91,6 +105,8 @@ public class M365ChatAdapter
     private static readonly TimeSpan SendEnableWait = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan NewChatWait = TimeSpan.FromSeconds(20);
     private const int MaxFillAttempts = 3;
+    // Some M365 accounts cap the composer at 8000 characters; a disabled Send above this length means "too long"
+    private const int LongPromptChars = 8000;
     private const int MaxPollIntervalMs = 5000;
     private const int MaxStreamingPollIntervalMs = 500;
 
@@ -183,7 +199,14 @@ public class M365ChatAdapter
                 if (string.IsNullOrWhiteSpace(filledText))
                     throw new InvalidOperationException("Failed to populate prompt into composer.");
                 if (!string.Equals(filledText.Trim(), promptText.Trim(), StringComparison.Ordinal))
+                {
+                    var accepted = filledText.Trim();
+                    if (accepted.Length < promptText.Trim().Length && promptText.Trim().StartsWith(accepted, StringComparison.Ordinal))
+                        throw new PromptTooLongException(
+                            $"Composer kept only {accepted.Length} of {promptText.Trim().Length} characters (input limit).",
+                            promptText.Trim().Length, accepted.Length);
                     throw new InvalidOperationException("Populated prompt in composer does not match requested prompt.");
+                }
 
                 var sendSeen = false;
                 var wiped = false;
@@ -212,6 +235,10 @@ public class M365ChatAdapter
 
                 if (sendButton != null)
                     break;
+
+                if (!wiped && sendSeen && promptText.Length > LongPromptChars)
+                    throw new PromptTooLongException(
+                        $"Send stayed disabled for a {promptText.Length}-character prompt (input limit).", promptText.Length, null);
 
                 if (!wiped || attempt >= MaxFillAttempts)
                     throw new InvalidOperationException(

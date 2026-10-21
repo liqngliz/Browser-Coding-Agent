@@ -121,6 +121,8 @@ public class RequestCoordinator
         }
 
         var (toolsEnabled, requiredToolLine) = ToolCalling.ParseChoice(request.ToolChoice);
+        if (tools.Count > 0)
+            _logger.LogInformation("Request tools: {Tools}", string.Join(", ", tools.Select(t => t.Name)));
         if (!toolsEnabled)
             tools = Array.Empty<ToolSpec>();
 
@@ -243,13 +245,16 @@ public class RequestCoordinator
                             .Where(p => !string.IsNullOrWhiteSpace(p)))
                         : $"{turn.Input}\n\n{ToolCalling.BuildInstructions(tools, requiredToolLine, firstTurn: false)}";
 
-                var rawAnswer = await _adapter.SendAndObserveAsync(
+                var rawAnswer = await SendPromptAsync(
                     page,
                     _replacements.PrepareOutgoing(prompt),
                     timeout,
                     httpContext.RequestAborted,
                     onSendDispatched: () =>
                     {
+                        // Once per request: chunked prompts dispatch one Send per part
+                        if (sendDispatched)
+                            return;
                         CurrentState = ChatTurnState.Generating;
                         sendDispatched = true;
                         if (stream != null)
@@ -275,7 +280,10 @@ public class RequestCoordinator
                 var toolCalls = new List<ToolCall>();
                 if (tools.Count > 0)
                 {
-                    (answer, toolCalls) = ToolCalling.ParseReply(answer, tools.Select(t => t.Name).ToHashSet(StringComparer.Ordinal));
+                    (answer, toolCalls) = ToolCalling.ParseReply(answer, tools.Select(t => t.Name).ToHashSet(StringComparer.Ordinal), out var rejected);
+                    foreach (var rejection in rejected)
+                        _logger.LogWarning("Reply contains a call-like block that stayed text: {Reason}. Requested tools: {Tools}",
+                            rejection, string.Join(", ", tools.Select(t => t.Name)));
                     if (toolCalls.Count > 0)
                         _logger.LogInformation("Reply contains {Count} tool call(s): {Names}",
                             toolCalls.Count, string.Join(", ", toolCalls.Select(c => c.Function.Name)));
@@ -429,6 +437,54 @@ public class RequestCoordinator
         {
             _gate.Release();
         }
+    }
+
+    // One message, or parts when the prompt exceeds Chat:MaxPromptChars or the composer refuses it before Send
+    // (some accounts cap it at 8000 characters). Parts share the chat; only the last part's reply is the answer.
+    private async Task<string> SendPromptAsync(
+        Microsoft.Playwright.IPage page,
+        string prompt,
+        TimeSpan timeout,
+        CancellationToken cancellation,
+        Action onSendDispatched,
+        Func<string, Task>? onProgress)
+    {
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        TimeSpan Remaining()
+        {
+            var remaining = timeout - stopwatch.Elapsed;
+            if (remaining <= TimeSpan.Zero)
+                throw new TimeoutException($"Response timeout of {timeout.TotalMinutes} minutes exceeded while sending a multi-part prompt.");
+            return remaining;
+        }
+
+        var limit = _chatOptions.MaxPromptChars;
+        if (limit == 0 || prompt.Length <= limit)
+        {
+            try
+            {
+                return await _adapter.SendAndObserveAsync(page, prompt, timeout, cancellation, onSendDispatched, onProgress);
+            }
+            catch (PromptTooLongException tooLong)
+            {
+                // Nothing was sent and the composer was cleared; stay under what it accepted
+                limit = tooLong.AcceptedLength is { } accepted
+                    ? Math.Max(PromptChunker.MinChunkChars, Math.Min(limit == 0 ? PromptChunker.DefaultLimit : limit, accepted - 500))
+                    : limit == 0 ? PromptChunker.DefaultLimit : limit;
+                _logger.LogWarning("{Reason} Resending in parts of at most {Limit} characters.", tooLong.Message, limit);
+            }
+        }
+
+        var parts = PromptChunker.Wrap(prompt, limit);
+        _logger.LogInformation("Sending a {Length}-character prompt in {Parts} parts (limit {Limit}).", prompt.Length, parts.Count, limit);
+        for (var i = 0; i < parts.Count - 1; i++)
+        {
+            var acknowledgement = await _adapter.SendAndObserveAsync(page, parts[i], Remaining(), cancellation, onSendDispatched);
+            _logger.LogInformation("Part {Part}/{Total} acknowledged: {Reply}", i + 1, parts.Count,
+                acknowledgement.Length > 80 ? acknowledgement[..80] + "..." : acknowledgement);
+        }
+
+        return await _adapter.SendAndObserveAsync(page, parts[^1], Remaining(), cancellation, onSendDispatched, onProgress);
     }
 
     // Comment lines keep proxies and clients from closing an idle stream while M365 is still thinking

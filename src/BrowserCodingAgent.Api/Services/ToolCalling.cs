@@ -74,7 +74,7 @@ public static class ToolCalling
         return (true, null);
     }
 
-    // Full instructions on the first turn of a chat; the M365 chat keeps them, later turns get the current tool names
+    // Full instructions on the first turn of a chat; later turns repeat the format and the exact names with parameters
     public static string BuildInstructions(IReadOnlyList<ToolSpec> tools, string? required, bool firstTurn)
     {
         // Explicit \n: AppendLine would write \r\n on Windows
@@ -105,11 +105,17 @@ public static class ToolCalling
                 sb.Append($"- {tool.Name}: {tool.Description?.Trim()}").Append('\n');
                 sb.Append($"  Parameters (JSON schema): {tool.ParametersJson}").Append('\n');
             }
+            sb.Append("Use only the tool names listed above, spelled exactly. Never invent other tool names.").Append('\n');
         }
         else
         {
-            sb.Append($"Tools available now: {string.Join(", ", tools.Select(t => t.Name))}. " +
-                          $"Request files, searches, and commands with ```{Fence} blocks as described earlier; do not ask the user to upload or paste anything.").Append('\n');
+            // Every later turn repeats the exact format and names: Copilot drifts to invented names otherwise
+            sb.Append("Tool call format: one fenced block per call, exactly:").Append('\n');
+            sb.Append($"```{Fence}").Append('\n');
+            sb.Append("{\"name\": \"<tool name>\", \"arguments\": {}}").Append('\n');
+            sb.Append("```").Append('\n');
+            sb.Append($"Tool names, use exactly these with these parameters: {string.Join(", ", tools.Select(Signature))}. Never invent other tool names.").Append('\n');
+            sb.Append("Request files, searches, and commands with these blocks; do not ask the user to upload or paste anything.").Append('\n');
         }
 
         if (required != null)
@@ -173,15 +179,23 @@ public static class ToolCalling
         return fence < 0 ? snapshot : snapshot[..fence];
     }
 
-    public static (string Text, List<ToolCall> Calls) ParseReply(string reply, IReadOnlyCollection<string> toolNames)
+    public static (string Text, List<ToolCall> Calls) ParseReply(string reply, IReadOnlyCollection<string> toolNames) =>
+        ParseReply(reply, toolNames, out _);
+
+    // rejected: call-like blocks that stayed text, with the reason (unknown tool name, invalid JSON)
+    public static (string Text, List<ToolCall> Calls) ParseReply(
+        string reply, IReadOnlyCollection<string> toolNames, out List<string> rejected)
     {
         var calls = new List<ToolCall>();
+        var rejections = new List<string>();
 
         // Any fence language: M365 relabels languages it does not know (tool_call shows as 'Shell').
         // Ordinary code stays text because a block must be valid JSON naming only requested tools.
         var text = FencedBlock.Replace(reply, match =>
         {
-            var parsed = TryParseCalls(match.Groups["body"].Value, toolNames);
+            var (parsed, rejection) = AnalyzeBlock(match.Groups["body"].Value, toolNames);
+            if (rejection != null)
+                rejections.Add(rejection);
             if (parsed.Count == 0)
                 return match.Value;
 
@@ -190,44 +204,115 @@ public static class ToolCalling
         });
 
         // No fences at all: the whole reply may be a bare call object
-        if (calls.Count == 0)
+        if (calls.Count == 0 && rejections.Count == 0)
         {
-            var bare = TryParseCalls(reply.Trim(), toolNames);
+            var (bare, rejection) = AnalyzeBlock(reply.Trim(), toolNames);
             if (bare.Count > 0)
+            {
+                rejected = rejections;
                 return (string.Empty, bare);
+            }
+            if (rejection != null && reply.TrimStart().StartsWith('{'))
+                rejections.Add(rejection);
         }
 
+        rejected = rejections;
         return (text, calls);
     }
 
-    private static List<ToolCall> TryParseCalls(string body, IReadOnlyCollection<string> toolNames)
+    private static readonly JsonReaderOptions LenientJson = new()
     {
-        var calls = new List<ToolCall>();
-        JsonElement root;
+        AllowTrailingCommas = true,
+        CommentHandling = JsonCommentHandling.Skip,
+        AllowMultipleValues = true // several call objects in one block, one after another
+    };
+
+    // All-or-nothing per block: every call must name a requested tool, or the whole block stays text.
+    // Rejection is reported only for blocks that look like a call (they mention "name" or "tool").
+    private static (List<ToolCall> Calls, string? Rejection) AnalyzeBlock(string body, IReadOnlyCollection<string> toolNames)
+    {
+        var looksLikeCall = body.Contains("\"name\"", StringComparison.Ordinal) || body.Contains("\"tool", StringComparison.Ordinal);
+        var values = new List<JsonElement>();
         try
         {
-            root = JsonDocument.Parse(body).RootElement;
+            var reader = new Utf8JsonReader(Encoding.UTF8.GetBytes(body), LenientJson);
+            while (reader.Read())
+            {
+                using var document = JsonDocument.ParseValue(ref reader);
+                values.Add(document.RootElement.Clone());
+            }
+        }
+        catch (JsonException ex)
+        {
+            return (new List<ToolCall>(), looksLikeCall ? $"invalid JSON ({ex.Message.Split('.')[0]})" : null);
+        }
+
+        var candidates = values.SelectMany(v => v.ValueKind == JsonValueKind.Array ? (IEnumerable<JsonElement>)v.EnumerateArray() : new[] { v }).ToList();
+        if (candidates.Count == 0)
+            return (new List<ToolCall>(), null);
+
+        var calls = new List<ToolCall>();
+        foreach (var candidate in candidates)
+        {
+            var (name, arguments) = ExtractCall(candidate);
+            if (name == null)
+                return (new List<ToolCall>(), looksLikeCall ? "no tool name" : null);
+            if (!toolNames.Contains(name))
+                return (new List<ToolCall>(), $"unknown tool '{name}'");
+
+            calls.Add(new ToolCall($"call_{Guid.NewGuid():N}"[..29], "function", new ToolCallFunction(name, arguments)));
+        }
+
+        return (calls, null);
+    }
+
+    // {"name", "arguments"} (taught format), also {"function": {...}} (OpenAI), "tool"/"tool_name" for the name,
+    // and "parameters"/"input"/"args" for the arguments
+    private static (string? Name, string Arguments) ExtractCall(JsonElement candidate)
+    {
+        if (candidate.ValueKind != JsonValueKind.Object)
+            return (null, "{}");
+
+        if (candidate.TryGetProperty("function", out var function) && function.ValueKind == JsonValueKind.Object)
+            candidate = function;
+
+        string? name = null;
+        foreach (var key in new[] { "name", "tool", "tool_name" })
+        {
+            if (candidate.TryGetProperty(key, out var value) && value.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(value.GetString()))
+            {
+                name = value.GetString();
+                break;
+            }
+        }
+
+        foreach (var key in new[] { "arguments", "parameters", "input", "args" })
+        {
+            if (candidate.TryGetProperty(key, out var args))
+                return (name, args.ValueKind == JsonValueKind.String ? args.GetString() ?? "{}" : JsonSerializer.Serialize(args, CompactJson));
+        }
+
+        return (name, "{}");
+    }
+
+    // read_files(files), editor(command, path, old_str?, new_str?): top-level parameters, optional ones marked '?'
+    public static string Signature(ToolSpec tool)
+    {
+        try
+        {
+            var schema = JsonDocument.Parse(tool.ParametersJson).RootElement;
+            if (!schema.TryGetProperty("properties", out var properties) || properties.ValueKind != JsonValueKind.Object)
+                return $"{tool.Name}()";
+
+            var required = schema.TryGetProperty("required", out var r) && r.ValueKind == JsonValueKind.Array
+                ? r.EnumerateArray().Select(x => x.GetString()).ToHashSet()
+                : new HashSet<string?>();
+            var parameters = properties.EnumerateObject().Select(p => required.Contains(p.Name) || required.Count == 0 ? p.Name : p.Name + "?");
+            return $"{tool.Name}({string.Join(", ", parameters)})";
         }
         catch (JsonException)
         {
-            return calls;
+            return $"{tool.Name}()";
         }
-
-        var candidates = root.ValueKind == JsonValueKind.Array ? root.EnumerateArray().ToList() : new List<JsonElement> { root };
-        foreach (var candidate in candidates)
-        {
-            if (candidate.ValueKind != JsonValueKind.Object ||
-                !candidate.TryGetProperty("name", out var name) || name.ValueKind != JsonValueKind.String ||
-                !toolNames.Contains(name.GetString()!))
-                return new List<ToolCall>(); // all-or-nothing: a block with an unknown tool stays text
-
-            var arguments = candidate.TryGetProperty("arguments", out var args)
-                ? args.ValueKind == JsonValueKind.String ? args.GetString() ?? "{}" : JsonSerializer.Serialize(args, CompactJson)
-                : "{}";
-
-            calls.Add(new ToolCall($"call_{Guid.NewGuid():N}"[..29], "function", new ToolCallFunction(name.GetString()!, arguments)));
-        }
-
-        return calls;
     }
 }

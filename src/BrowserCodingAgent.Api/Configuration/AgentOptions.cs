@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using BrowserCodingAgent.Api.Services;
 
 namespace BrowserCodingAgent.Api.Configuration;
 
@@ -71,6 +72,10 @@ public class ChatOptions
     public string? StopGeneratingSelector { get; set; }
     public string? NewChatSelector { get; set; }
 
+    // Longest prompt sent in one message; longer prompts go in parts. 0 = only when the composer refuses a prompt
+    // (it then chunks under the observed limit). Accounts with an 8000-character composer: 7000.
+    public int MaxPromptChars { get; set; }
+
     // Prompt/reply replacement rules; default lookup ~/.browser-coding-agent/replacements.json, then the bundled file
     public string? ReplacementsFile { get; set; }
 
@@ -78,6 +83,9 @@ public class ChatOptions
     {
         if (string.IsNullOrWhiteSpace(ModelAlias))
             throw new InvalidOperationException("Chat:ModelAlias cannot be empty.");
+
+        if (MaxPromptChars != 0 && MaxPromptChars < PromptChunker.MinChunkChars)
+            throw new InvalidOperationException($"Chat:MaxPromptChars must be 0 or at least {PromptChunker.MinChunkChars}. Got {MaxPromptChars}.");
 
         if (ResponseTimeoutMinutes < 1 || ResponseTimeoutMinutes > 120)
             throw new InvalidOperationException($"Chat:ResponseTimeoutMinutes must be between 1 and 120. Got {ResponseTimeoutMinutes}.");

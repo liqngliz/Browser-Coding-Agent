@@ -238,3 +238,47 @@ public class PromptReplacementsTests
         Assert.Contains(Path.GetFullPath("/nonexistent/replacements.json"), ex.Message);
     }
 }
+
+public class PromptChunkerTests
+{
+    private static string Lines(int count) => string.Concat(Enumerable.Range(0, count).Select(i => $"line {i:D5} of the tool output\n"));
+
+    [Fact]
+    public void Split_ReassemblesExactly_AndCutsAtLineBreaks()
+    {
+        var text = Lines(1000);
+
+        var chunks = PromptChunker.Split(text, 6700);
+
+        Assert.Equal(text, string.Concat(chunks));
+        Assert.All(chunks, c => Assert.True(c.Length <= 6700));
+        Assert.All(chunks.SkipLast(1), c => Assert.EndsWith("\n", c));
+    }
+
+    [Fact]
+    public void Split_WithoutLineBreaks_CutsAtWindow()
+    {
+        var text = new string('x', 15000);
+
+        var chunks = PromptChunker.Split(text, 6700);
+
+        Assert.Equal(new[] { 6700, 6700, 1600 }, chunks.Select(c => c.Length));
+    }
+
+    [Fact]
+    public void Wrap_NumbersParts_KeepsEachUnderLimit_AndAsksForTheAnswerLast()
+    {
+        var parts = PromptChunker.Wrap(Lines(1000), 7000);
+
+        Assert.True(parts.Count > 1);
+        Assert.All(parts, p => Assert.True(p.Length <= 7000, $"part has {p.Length} chars"));
+        Assert.StartsWith($"Part 1 of {parts.Count} of one long message. Do not answer or act on it yet; reply only with: received 1/{parts.Count}", parts[0]);
+        Assert.StartsWith($"Part {parts.Count} of {parts.Count}. The message is complete.", parts[^1]);
+    }
+
+    [Fact]
+    public void Wrap_ShortPrompt_IsSentAsIs()
+    {
+        Assert.Equal(new[] { "short" }, PromptChunker.Wrap("short", 7000));
+    }
+}
