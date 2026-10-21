@@ -163,6 +163,8 @@ public class M365ChatAdapter
         // M365 virtualizes long chats (older replies leave the DOM as new ones arrive), so the count can stay flat.
         // When the newest reply has an identity, the answer is the newest reply once that identity changes.
         var initialLatestReplyId = await GetLatestReplyIdAsync(page);
+        // Only a finished reply with a real id anchors the comparison; replies without ids fall back to counting
+        var useReplyIds = !string.IsNullOrEmpty(initialLatestReplyId);
 
         clientCancellation.ThrowIfCancellationRequested();
 
@@ -290,8 +292,8 @@ public class M365ChatAdapter
             }
 
             var currentAssistantCount = await GetAssistantMessageCountAsync(page);
-            var latestReplyId = initialLatestReplyId != null ? await GetLatestReplyIdAsync(page) : null;
-            var hasNewReply = initialLatestReplyId != null
+            var latestReplyId = useReplyIds ? await GetLatestReplyIdAsync(page) : null;
+            var hasNewReply = useReplyIds
                 ? currentAssistantCount > 0 && latestReplyId != initialLatestReplyId
                 : currentAssistantCount > initialAssistantCount;
 

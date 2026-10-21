@@ -24,6 +24,10 @@ execFileSync('dotnet', ['publish', path.join(repo, 'src', 'BrowserCodingAgent.Ap
   '--self-contained', 'false', '-p:UseAppHost=false', '-p:PlaywrightPlatform=all',
   `-p:Version=${values.version}`, '-o', path.join(stage, 'app')], { stdio: 'inherit' });
 
+// Drop the bundled Node binaries (~560 MB unpacked; npm rejected the ~200 MB tarball with E413).
+// The launcher points PLAYWRIGHT_NODEJS_PATH at the Node running it; the driver JavaScript stays.
+fs.rmSync(path.join(stage, 'app', '.playwright', 'node'), { recursive: true, force: true });
+
 const pkgPath = path.join(stage, 'package.json');
 const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
 pkg.version = values.version;
@@ -38,11 +42,12 @@ const required = [
   'package.json', 'browser-coding-agent.cjs', 'README.md', 'LICENSE',
   'app/BrowserCodingAgent.Api.dll', 'app/BrowserCodingAgent.Api.deps.json',
   'app/BrowserCodingAgent.Api.runtimeconfig.json', 'app/appsettings.json', 'app/replacements.json', 'app/Microsoft.Playwright.dll',
-  'app/.playwright/package/cli.js', 'app/.playwright/node/LICENSE',
-  'app/.playwright/node/darwin-arm64/node', 'app/.playwright/node/darwin-x64/node', 'app/.playwright/node/win32_x64/node.exe',
+  'app/.playwright/package/cli.js', 'app/.playwright/package/package.json',
 ];
-const executable = ['browser-coding-agent.cjs', 'app/.playwright/node/darwin-arm64/node', 'app/.playwright/node/darwin-x64/node'];
-const forbidden = /(^|\/)(profiles|UserData|Default\/Cookies)(\/|$)|(^|\/)\.env(\.|$)|\.nupkg$/;
+const executable = ['browser-coding-agent.cjs'];
+const forbidden = /(^|\/)(profiles|UserData|Default\/Cookies)(\/|$)|(^|\/)\.env(\.|$)|\.nupkg$|^app\/\.playwright\/node\//;
+// npm rejected 213 MB (E413); stay far below whatever the limit is
+const maxPackedBytes = 50 * 1024 * 1024;
 
 const problems = [
   ...required.filter(p => !files.has(p)).map(p => `missing ${p}`),
@@ -50,6 +55,7 @@ const problems = [
   ...[...files.keys()].filter(p => forbidden.test(p)).map(p => `forbidden ${p}`),
 ];
 if (pkg.version !== report.version) problems.push(`packed version ${report.version} != ${pkg.version}`);
+if (report.size > maxPackedBytes) problems.push(`packed size ${report.size} bytes exceeds ${maxPackedBytes}`);
 
 const tgz = path.join(out, report.filename);
 const mb = n => (n / 1024 / 1024).toFixed(1);

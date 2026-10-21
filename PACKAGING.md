@@ -7,7 +7,7 @@ Ship the same C# application through both distribution channels, with matching r
 | Target | Proposed package | Execution | User prerequisites |
 | --- | --- | --- | --- |
 | .NET tool on NuGet | `BrowserCodingAgent` | `browser-coding-agent` after installation, or `dnx BrowserCodingAgent` | .NET 10 SDK with the required ASP.NET Core runtime, plus installed Chrome/Edge |
-| npm package | `@liqngliz/browser-coding-agent` | `npx @liqngliz/browser-coding-agent` | Node/npm plus installed Chrome/Edge; launcher bootstraps a private ASP.NET Core runtime |
+| npm package | `@liqngliz/browser-coding-agent` | `npx @liqngliz/browser-coding-agent` | Node >= 20 and npm plus installed Chrome/Edge; launcher bootstraps a private ASP.NET Core runtime |
 
 Both names were unregistered on 2026-10-21 (npm and nuget.org returned 404). Neither distribution is published yet.
 
@@ -113,7 +113,7 @@ Preserve the complete `.playwright/` directory, its relative layout, executable 
 
 Do not bundle browser binaries or download Chromium at startup. The configured `chrome` or `msedge` channel uses an installed browser; show a clear diagnostic when it is missing. Browser integration tests need a graphical session, or a virtual display on Linux, because this application intentionally opens a visible window.
 
-Possible later size optimization: Playwright's driver source supports `PLAYWRIGHT_NODEJS_PATH`. The launcher could set it to `process.execPath` and omit redundant bundled Node binaries while retaining the matching driver JavaScript. This needs tests against the pinned Playwright release and supported Node versions before adoption. Do not use `PlaywrightPlatform=none` as a shortcut: in the inspected build targets it also removes the driver JavaScript.
+Implemented: `scripts/package-npm.mjs` deletes `app/.playwright/node/` (563 MB unpacked) and keeps the driver JavaScript (`.playwright/package`, 13 MB, `playwright-core` engines `node >=20`). The launcher sets `PLAYWRIGHT_NODEJS_PATH` to `process.execPath` (honored by Playwright .NET `Driver.cs`) and rejects Node < 20. npm rejected the 213 MB tarball with E413; `package-npm.mjs` now fails above 50 MB packed. The `.nupkg` keeps the bundled Node binaries because .NET tool users may have no Node.
 
 ## Launcher responsibilities
 
@@ -135,7 +135,7 @@ These changes do not add timing configuration. `Chat.ResponseTimeoutMinutes` rem
 - Begin with Windows x64 and macOS x64/Arm64 as proposed test targets. Add Linux only after testing its desktop and native runtime/browser prerequisites. Reject untested combinations clearly rather than inferring support from portable DLLs alone.
 - Arrange publish access to the npm scope and the initial package publication, then configure GitHub Actions as an npm trusted publisher for this repository and workflow. Use `id-token: write` and a supported Node/npm pair; current npm documentation requires Node >=22.14.0 and npm >=11.5.1 for trusted publishing. These are publishing prerequisites, distinct from the launcher runtime minimum, which should be set from actual tests.
 
-Measured 2026-10-21 (macOS arm64): `.nupkg` 213 MB (nuget.org limit 250 MB); npm `.tgz` 202 MB packed, 577 MB unpacked. Both passed `scripts/smoke.mjs` locally (startup, health, simulated chat round trip, SIGINT shutdown). Windows and macOS x64 are verified only by CI.
+Measured 2026-10-21 (macOS arm64): `.nupkg` 213 MB (nuget.org limit 250 MB); npm `.tgz` 4.4 MB packed, 15.6 MB unpacked (without bundled Node). Both passed `scripts/smoke.mjs` locally (startup, health, simulated chat round trip, streamed later turn, SIGINT shutdown) and in CI on Windows, macOS arm64, and macOS x64.
 
 ## GitHub Actions deliverables
 

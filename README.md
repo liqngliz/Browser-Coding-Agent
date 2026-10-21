@@ -10,6 +10,7 @@ See [PLAN.md](PLAN.md) and [PACKAGING.md](PACKAGING.md) for architectural and pa
 
 - .NET 10 SDK
 - Google Chrome or Microsoft Edge installed on the host OS
+- npm package only: Node 20 or newer (Playwright's driver runs on it)
 
 ## Build and test
 

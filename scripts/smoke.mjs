@@ -51,12 +51,16 @@ const FAKE_CHAT = `<!DOCTYPE html><html><body>
     user.textContent = text;
     document.getElementById('log').append(user);
     stop.style.display = 'inline-block';
+    // Marked like M365 (markdown-reply, aria-hidden true -> false), so completion does not depend on a poll
+    // catching the 1.5s Stop window on a slow runner
+    const reply = document.createElement('div');
+    reply.setAttribute('data-testid', 'markdown-reply');
+    reply.setAttribute('aria-hidden', 'true');
+    document.getElementById('log').append(reply);
     setTimeout(() => {
-      const reply = document.createElement('div');
-      reply.setAttribute('data-message-author', 'assistant');
       reply.innerHTML = '<p></p>';
       reply.firstChild.textContent = 'echo: ' + text;
-      document.getElementById('log').append(reply);
+      reply.setAttribute('aria-hidden', 'false');
       stop.style.display = 'none';
     }, 1500);
   });

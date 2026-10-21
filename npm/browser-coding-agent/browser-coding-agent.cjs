@@ -8,6 +8,7 @@ const crypto = require('crypto'), fs = require('fs'), os = require('os'), path =
 
 const RUNTIME_VERSION = '10.0.13';  // tested ASP.NET Core patch; bump per release
 const SUPPORTED = ['darwin-arm64', 'darwin-x64', 'win32-x64'];
+const MIN_NODE_MAJOR = 20;
 
 const win = process.platform === 'win32';
 const target = `${process.platform}-${process.arch}`;
@@ -64,6 +65,9 @@ async function installRuntime() {
 async function main() {
   if (!SUPPORTED.includes(target) && process.env.BROWSER_CODING_AGENT_ALLOW_UNSUPPORTED !== '1')
     fail(`unsupported platform ${target}. Supported: ${SUPPORTED.join(', ')}.`);
+  // The Playwright driver (playwright-core, engines node >=20) runs on this Node instead of a bundled one
+  if (Number(process.versions.node.split('.')[0]) < MIN_NODE_MAJOR)
+    fail(`Node ${process.versions.node} is too old; Node ${MIN_NODE_MAJOR} or newer is required.`);
   if (!fs.existsSync(appDll))
     fail(`application not found at ${appDll}; the package is incomplete.`);
 
@@ -77,7 +81,9 @@ async function main() {
     }
   }
 
-  const child = spawn(muxer, [appDll, ...process.argv.slice(2)], { stdio: 'inherit' });
+  // The package ships without .playwright/node binaries (npm rejects the ~200 MB tarball they make)
+  const env = { ...process.env, PLAYWRIGHT_NODEJS_PATH: process.env.PLAYWRIGHT_NODEJS_PATH || process.execPath };
+  const child = spawn(muxer, [appDll, ...process.argv.slice(2)], { stdio: 'inherit', env });
   const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
   const forward = sig => { if (child.exitCode === null) child.kill(sig); };
   for (const sig of signals) process.on(sig, forward);

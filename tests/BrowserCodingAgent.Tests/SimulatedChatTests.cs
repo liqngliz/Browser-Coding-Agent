@@ -442,6 +442,44 @@ public class SimulatedChatTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task SendAndObserveAsync_RepliesWithoutIds_FallBackToCounting()
+    {
+        var page = await _browser!.NewPageAsync();
+        var html = @"
+<!DOCTYPE html>
+<html>
+<body>
+  <div id='feed'><div data-testid='markdown-reply' aria-hidden='false'><p>first answer</p></div></div>
+  <textarea placeholder='Ask Microsoft 365 Copilot'></textarea>
+  <button aria-label='Submit message'>Send</button>
+  <button aria-label='Stop generating' style='display:none'>Stop</button>
+  <script>
+    const stop = document.querySelector(""button[aria-label='Stop generating']"");
+    document.querySelector(""button[aria-label='Submit message']"").addEventListener('click', () => {
+      document.querySelector('textarea').value = '';
+      const reply = document.createElement('div');
+      reply.setAttribute('data-testid', 'markdown-reply');
+      reply.setAttribute('aria-hidden', 'true');
+      document.getElementById('feed').append(reply);
+      stop.style.display = 'inline-block';
+      setTimeout(() => {
+        reply.innerHTML = '<p>second answer</p>';
+        reply.setAttribute('aria-hidden', 'false');
+        stop.style.display = 'none';
+      }, 400);
+    });
+  </script>
+</body>
+</html>";
+        await page.SetContentAsync(html);
+
+        var adapter = CreateAdapter();
+        var result = await adapter.SendAndObserveAsync(page, "Next question", TimeSpan.FromSeconds(20), CancellationToken.None);
+
+        Assert.Equal("second answer", result);
+    }
+
+    [Fact]
     public async Task CheckPageReadyAsync_WhenDailyLimitReached_ReturnsNotReady()
     {
         var page = await _browser!.NewPageAsync();
