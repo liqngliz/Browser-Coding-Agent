@@ -30,6 +30,7 @@ dnx BrowserCodingAgent --urls http://localhost:5029 --Browser:Channel=msedge
 | `--Browser:UserDataDirectory` | `~/.browser-coding-agent/profiles/<channel>` | browser profile (keeps the sign-in) |
 | `--Chat:ResponseTimeoutMinutes` | `10` | wait per answer |
 | `--Chat:MaxPromptChars` | `0` | split longer prompts into parts; `7000` for accounts with an 8000-character composer |
+| `--Chat:SendEnableSeconds` | `30` | wait for Send after filling; focus + Enter at 10s |
 | `--Chat:ReplacementsFile` | `~/.browser-coding-agent/replacements.json`, then bundled | prompt/reply replacement rules |
 
 ## Client setup (Cline)

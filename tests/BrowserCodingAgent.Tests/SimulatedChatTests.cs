@@ -27,12 +27,13 @@ public class SimulatedChatTests : IAsyncLifetime
         _playwright?.Dispose();
     }
 
-    private M365ChatAdapter CreateAdapter(int timeoutMinutes = 1)
+    private M365ChatAdapter CreateAdapter(int timeoutMinutes = 1, int sendEnableSeconds = 30)
     {
         var options = Options.Create(new ChatOptions
         {
             ModelAlias = "m365-active",
-            ResponseTimeoutMinutes = timeoutMinutes
+            ResponseTimeoutMinutes = timeoutMinutes,
+            SendEnableSeconds = sendEnableSeconds
         });
         return new M365ChatAdapter(options, NullLogger<M365ChatAdapter>.Instance);
     }
@@ -508,6 +509,117 @@ public class SimulatedChatTests : IAsyncLifetime
         Assert.False(await page.EvaluateAsync<bool>("window.sendClicked"));
         Assert.Equal(string.Empty, await page.EvaluateAsync<string>("document.querySelector('textarea').value"));
 
+        var (ready, _) = await adapter.CheckPageReadyAsync(page);
+        Assert.True(ready);
+    }
+
+    // submit(): what the page does when it accepts a message (clear composer, show Stop, reply after 300ms)
+    private const string SubmitScript = @"
+    window.processed = 0;
+    const composer = document.querySelector('textarea');
+    const sendBtn = document.querySelector(""button[aria-label='Submit message']"");
+    const stopBtn = document.querySelector(""button[aria-label='Stop generating']"");
+    function submit() {
+      window.processed++;
+      composer.value = '';
+      stopBtn.style.display = 'inline-block';
+      setTimeout(() => {
+        const turn = document.createElement('div');
+        turn.setAttribute('data-message-author', 'assistant');
+        turn.innerText = 'ANSWER';
+        document.getElementById('messages').appendChild(turn);
+        stopBtn.style.display = 'none';
+      }, 300);
+    }";
+
+    private static string SendPage(string behavior) => @"
+<!DOCTYPE html>
+<html>
+<body>
+  <div id='messages'></div>
+  <textarea placeholder='Ask Microsoft 365 Copilot'></textarea>
+  <button aria-label='Submit message'>Send</button>
+  <button aria-label='Stop generating' style='display:none'>Stop</button>
+  <script>" + SubmitScript + behavior + @"
+  </script>
+</body>
+</html>";
+
+    [Fact]
+    public async Task SendAndObserveAsync_LostFirstClick_IsRetried_AndSentOnce()
+    {
+        var page = await _browser!.NewPageAsync();
+        await page.SetContentAsync(SendPage(@"
+    window.clicks = 0;
+    sendBtn.addEventListener('click', () => { if (++window.clicks > 1) submit(); });"));
+
+        var result = await CreateAdapter().SendAndObserveAsync(page, "Hello", TimeSpan.FromSeconds(60), CancellationToken.None);
+
+        Assert.Equal("ANSWER", result);
+        Assert.Equal(2, await page.EvaluateAsync<int>("window.clicks"));
+        Assert.Equal(1, await page.EvaluateAsync<int>("window.processed"));
+    }
+
+    [Fact]
+    public async Task SendAndObserveAsync_ClicksIgnored_EnterSubmits()
+    {
+        var page = await _browser!.NewPageAsync();
+        await page.SetContentAsync(SendPage(@"
+    composer.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });"));
+
+        var result = await CreateAdapter().SendAndObserveAsync(page, "Hello", TimeSpan.FromSeconds(60), CancellationToken.None);
+
+        Assert.Equal("ANSWER", result);
+        Assert.Equal(1, await page.EvaluateAsync<int>("window.processed"));
+    }
+
+    [Fact]
+    public async Task SendAndObserveAsync_StalledEditor_RefillEnablesSend()
+    {
+        // Send enables only after a second input event, like an editor that missed the first fill
+        var page = await _browser!.NewPageAsync();
+        await page.SetContentAsync(SendPage(@"
+    window.inputs = 0;
+    sendBtn.disabled = true;
+    composer.addEventListener('input', () => { if (composer.value && ++window.inputs >= 2) sendBtn.disabled = false; });
+    sendBtn.addEventListener('click', submit);"));
+
+        var result = await CreateAdapter(sendEnableSeconds: 6).SendAndObserveAsync(page, "Hello", TimeSpan.FromSeconds(60), CancellationToken.None);
+
+        Assert.Equal("ANSWER", result);
+        Assert.True(await page.EvaluateAsync<int>("window.inputs") >= 2);
+    }
+
+    [Fact]
+    public async Task SendAndObserveAsync_SendNeverEnables_FocusAndEnterSubmits()
+    {
+        // Send stays disabled (network stall); the composer still submits on Enter
+        var page = await _browser!.NewPageAsync();
+        await page.SetContentAsync(SendPage(@"
+    sendBtn.disabled = true;
+    composer.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });"));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var result = await CreateAdapter(sendEnableSeconds: 6).SendAndObserveAsync(page, "Hello", TimeSpan.FromSeconds(60), CancellationToken.None);
+
+        Assert.Equal("ANSWER", result);
+        Assert.Equal(1, await page.EvaluateAsync<int>("window.processed"));
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(15), $"took {sw.Elapsed.TotalSeconds:F1}s");
+    }
+
+    [Fact]
+    public async Task SendAndObserveAsync_NeverAccepted_FailsCleanly()
+    {
+        var page = await _browser!.NewPageAsync();
+        await page.SetContentAsync(SendPage(""));
+
+        var adapter = CreateAdapter();
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            adapter.SendAndObserveAsync(page, "Hello", TimeSpan.FromSeconds(90), CancellationToken.None));
+
+        Assert.Contains("did not accept the message after 3 send attempts", ex.Message);
+        Assert.Equal(0, await page.EvaluateAsync<int>("window.processed"));
+        Assert.Equal(string.Empty, await page.EvaluateAsync<string>("document.querySelector('textarea').value"));
         var (ready, _) = await adapter.CheckPageReadyAsync(page);
         Assert.True(ready);
     }

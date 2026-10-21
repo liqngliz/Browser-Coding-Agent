@@ -76,6 +76,10 @@ public class ChatOptions
     // (it then chunks under the observed limit). Accounts with an 8000-character composer: 7000.
     public int MaxPromptChars { get; set; }
 
+    // Wait for Send to enable after filling the composer (M365 needs ~3s; longer on a slow network)
+    [Range(5, 300)]
+    public int SendEnableSeconds { get; set; } = 30;
+
     // Prompt/reply replacement rules; default lookup ~/.browser-coding-agent/replacements.json, then the bundled file
     public string? ReplacementsFile { get; set; }
 
@@ -86,6 +90,9 @@ public class ChatOptions
 
         if (MaxPromptChars != 0 && MaxPromptChars < PromptChunker.MinChunkChars)
             throw new InvalidOperationException($"Chat:MaxPromptChars must be 0 or at least {PromptChunker.MinChunkChars}. Got {MaxPromptChars}.");
+
+        if (SendEnableSeconds < 5 || SendEnableSeconds > 300)
+            throw new InvalidOperationException($"Chat:SendEnableSeconds must be between 5 and 300. Got {SendEnableSeconds}.");
 
         if (ResponseTimeoutMinutes < 1 || ResponseTimeoutMinutes > 120)
             throw new InvalidOperationException($"Chat:ResponseTimeoutMinutes must be between 1 and 120. Got {ResponseTimeoutMinutes}.");

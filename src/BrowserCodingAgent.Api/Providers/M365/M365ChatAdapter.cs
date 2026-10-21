@@ -82,6 +82,7 @@ public class M365ChatAdapter
 
     private static readonly string[] DefaultUserMessageSelectors =
     {
+        "[data-testid='chatQuestion']",
         "[data-message-author='user']",
         "[data-content='user-message']",
         "div[data-testid*='user-message']",
@@ -102,7 +103,10 @@ public class M365ChatAdapter
         "[data-testid*='new-chat']"
     };
 
-    private static readonly TimeSpan SendEnableWait = TimeSpan.FromSeconds(10);
+    // A click lost to a re-render or network stall leaves the prompt in the composer; confirm within this window
+    private static readonly TimeSpan SendConfirmWait = TimeSpan.FromSeconds(5);
+    private const int MaxSendAttempts = 3; // click, click, then focus + Enter in the composer
+    private static readonly TimeSpan EnterFallbackAfter = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan NewChatWait = TimeSpan.FromSeconds(20);
     private const int MaxFillAttempts = 3;
     // Some M365 accounts cap the composer at 8000 characters; a disabled Send above this length means "too long"
@@ -186,13 +190,67 @@ public class M365ChatAdapter
 
         clientCancellation.ThrowIfCancellationRequested();
 
+        var initialUserCount = await GetUserMessageCountAsync(page);
+        var submittedByEnter = false;
+
+        // Waits up to Chat:SendEnableSeconds for an enabled Send (M365 needs ~3s after a fill; longer on a slow network).
+        // At 10s (or half the wait) a still-disabled Send gets focus + Enter in the composer, which can submit on its
+        // own; at two thirds, one refill re-runs a stalled editor's input handling.
+        async Task<(ILocator? Button, bool Seen, bool Wiped, bool Submitted)> WaitForEnabledSendAsync()
+        {
+            var seen = false;
+            var enterTried = false;
+            var refilled = false;
+            var started = stopwatch.Elapsed;
+            var wait = TimeSpan.FromSeconds(_chatOptions.SendEnableSeconds);
+            var enterAfter = TimeSpan.FromTicks(Math.Min(EnterFallbackAfter.Ticks, wait.Ticks / 2));
+            var enterSpent = TimeSpan.Zero; // the Enter attempt's own confirmation wait does not count against the Send wait
+            while (stopwatch.Elapsed - started - enterSpent < wait)
+            {
+                var (candidate, _) = await FindFirstElementAsync(page, GetSendButtonSelectors(), Math.Min(250, GetRemainingBudgetMs()));
+                if (candidate != null)
+                {
+                    seen = true;
+                    if (await candidate.IsEnabledAsync())
+                        return (candidate, true, false, false);
+                }
+
+                if (string.IsNullOrWhiteSpace(await GetComposerTextAsync(composer, Math.Min(500, GetRemainingBudgetMs()))))
+                    return (null, seen, true, false);
+
+                var waited = stopwatch.Elapsed - started - enterSpent;
+                if (!enterTried && waited > enterAfter)
+                {
+                    enterTried = true;
+                    _logger.LogWarning("Send still disabled after {Seconds:F0}s; focusing the composer and pressing Enter.", waited.TotalSeconds);
+                    var enterStarted = stopwatch.Elapsed;
+                    if (await PressEnterInComposerAsync(composer, GetRemainingBudgetMs()) &&
+                        await WaitForSubmissionAsync(page, composer, promptText, initialUserCount, initialAssistantCount,
+                            initialLatestReplyId, useReplyIds, conversationUrl, clientCancellation))
+                        return (null, seen, false, true);
+                    enterSpent = stopwatch.Elapsed - enterStarted;
+                    continue; // re-check Send right away: the key press itself can enable it
+                }
+                else if (!refilled && waited > wait * 2 / 3)
+                {
+                    refilled = true;
+                    _logger.LogWarning("Send still disabled after {Seconds:F0}s; filling the composer again to retrigger the editor.", waited.TotalSeconds);
+                    await composer.FillAsync(promptText, new LocatorFillOptions { Timeout = GetRemainingBudgetMs() });
+                }
+
+                await Task.Delay((int)Math.Min(100, GetRemainingBudgetMs()), clientCancellation);
+            }
+
+            return (null, seen, false, false);
+        }
+
         // 3-4. Fill, verify exact text, then wait for an enabled Send.
         // M365 keeps Send disabled for a few seconds after the editor receives text, and a freshly loaded
         // (server-rendered) page can wipe the editor when its scripts attach: text that vanishes is filled again.
         ILocator? sendButton = null;
         try
         {
-            for (var attempt = 1; sendButton == null; attempt++)
+            for (var attempt = 1; sendButton == null && !submittedByEnter; attempt++)
             {
                 await composer.FillAsync(promptText, new LocatorFillOptions { Timeout = GetRemainingBudgetMs() });
                 var filledText = await GetComposerTextAsync(composer, Math.Min(500, GetRemainingBudgetMs()));
@@ -208,32 +266,10 @@ public class M365ChatAdapter
                     throw new InvalidOperationException("Populated prompt in composer does not match requested prompt.");
                 }
 
-                var sendSeen = false;
-                var wiped = false;
-                var sendEnableDeadline = stopwatch.Elapsed + SendEnableWait;
-                while (stopwatch.Elapsed < sendEnableDeadline)
-                {
-                    var (candidate, _) = await FindFirstElementAsync(page, GetSendButtonSelectors(), Math.Min(250, GetRemainingBudgetMs()));
-                    if (candidate != null)
-                    {
-                        sendSeen = true;
-                        if (await candidate.IsEnabledAsync())
-                        {
-                            sendButton = candidate;
-                            break;
-                        }
-                    }
-
-                    if (string.IsNullOrWhiteSpace(await GetComposerTextAsync(composer, Math.Min(500, GetRemainingBudgetMs()))))
-                    {
-                        wiped = true;
-                        break;
-                    }
-
-                    await Task.Delay((int)Math.Min(100, GetRemainingBudgetMs()), clientCancellation);
-                }
-
-                if (sendButton != null)
+                var (enabledSend, sendSeen, wiped, submitted) = await WaitForEnabledSendAsync();
+                sendButton = enabledSend;
+                submittedByEnter = submitted;
+                if (sendButton != null || submittedByEnter)
                     break;
 
                 if (!wiped && sendSeen && promptText.Length > LongPromptChars)
@@ -250,7 +286,37 @@ public class M365ChatAdapter
                     attempt + 1, MaxFillAttempts);
             }
 
-            clientCancellation.ThrowIfCancellationRequested();
+            // 5. Click Send, then confirm M365 took the message: the composer still holding the exact prompt means the
+            // send failed (a click lost to a re-render or network stall). Retried (the last attempt is focus + Enter),
+            // never repeated once accepted.
+            for (var sendAttempt = 1; !submittedByEnter; sendAttempt++)
+            {
+                clientCancellation.ThrowIfCancellationRequested();
+                try
+                {
+                    if (sendAttempt < MaxSendAttempts)
+                        await sendButton!.ClickAsync(new LocatorClickOptions { Timeout = Math.Min(5000, GetRemainingBudgetMs()) });
+                    else
+                        await PressEnterInComposerAsync(composer, GetRemainingBudgetMs());
+                }
+                catch (Exception ex) when ((ex is PlaywrightException || ex is TimeoutException) && sendAttempt < MaxSendAttempts)
+                {
+                    _logger.LogWarning("Send attempt {Attempt} failed: {Message}", sendAttempt, ex.Message.Split('\n')[0]);
+                }
+
+                if (await WaitForSubmissionAsync(page, composer, promptText, initialUserCount, initialAssistantCount,
+                        initialLatestReplyId, useReplyIds, conversationUrl, clientCancellation))
+                    break;
+
+                if (sendAttempt >= MaxSendAttempts)
+                    throw new InvalidOperationException($"M365 did not accept the message after {MaxSendAttempts} send attempts; nothing was sent.");
+
+                _logger.LogWarning("Send attempt {Attempt} did not take effect (prompt still in the composer); retrying.", sendAttempt);
+                var (retrySend, _, emptied, submitted) = await WaitForEnabledSendAsync();
+                if (emptied || submitted)
+                    break; // the composer emptied late, or Enter submitted: the message went out
+                sendButton = retrySend ?? sendButton;
+            }
         }
         catch
         {
@@ -258,12 +324,6 @@ public class M365ChatAdapter
             await ClearComposerQuietlyAsync(composer);
             throw;
         }
-
-        // 5. Dispatch single Send click
-        await sendButton.ClickAsync(new LocatorClickOptions
-        {
-            Timeout = Math.Min(5000, GetRemainingBudgetMs())
-        });
 
         onSendDispatched?.Invoke();
         _logger.LogInformation("Prompt sent to browser UI. Observing response...");
@@ -595,6 +655,97 @@ public class M365ChatAdapter
         {
             return string.Empty;
         }
+    }
+
+    // Accepted unless the composer still holds exactly the prompt with no other sign of submission. Other signs:
+    // Stop shown, a new user message or reply, an error/limit banner (the observe loop reports it), another conversation
+    private async Task<bool> WaitForSubmissionAsync(
+        IPage page, ILocator composer, string promptText, int initialUserCount, int initialAssistantCount,
+        string? initialLatestReplyId, bool useReplyIds, string conversationUrl, CancellationToken cancellation)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        while (stopwatch.Elapsed < SendConfirmWait)
+        {
+            if (page.IsClosed)
+                return false;
+
+            try
+            {
+                if (!string.Equals(await GetComposerTextAsync(composer, 300), promptText.Trim(), StringComparison.Ordinal))
+                    return true; // emptied (or changed): the text left the composer
+
+                var (stop, _) = await FindFirstElementAsync(page, GetStopGeneratingSelectors(), 50);
+                if (stop != null)
+                    return true;
+
+                if (await GetUserMessageCountAsync(page) > initialUserCount)
+                    return true;
+
+                var replies = await GetAssistantMessageCountAsync(page);
+                if (useReplyIds ? replies > 0 && await GetLatestReplyIdAsync(page) != initialLatestReplyId : replies > initialAssistantCount)
+                    return true;
+
+                var (banner, _) = await FindFirstElementAsync(page, GetErrorBannerSelectors(), 50);
+                if (banner != null || await FindUsageLimitNoticeAsync(page) != null)
+                    return true;
+
+                if (!IsSamePage(conversationUrl, page.Url))
+                    return true;
+            }
+            catch (PlaywrightException)
+            {
+                // Page re-rendering; check again
+            }
+
+            await Task.Delay(200, cancellation);
+        }
+
+        return false;
+    }
+
+    // Click into the composer to focus it, put the caret at the end (a click lands mid-text, where Enter would only
+    // insert a line break and change the text), then press Enter. False when the composer could not be focused.
+    private async Task<bool> PressEnterInComposerAsync(ILocator composer, float budgetMs)
+    {
+        try
+        {
+            var timeout = Math.Min(5000, budgetMs);
+            await composer.ClickAsync(new LocatorClickOptions { Timeout = timeout });
+            await composer.EvaluateAsync(@"el => {
+                if (typeof el.setSelectionRange === 'function') { el.setSelectionRange(el.value.length, el.value.length); return; }
+                const range = document.createRange();
+                range.selectNodeContents(el);
+                range.collapse(false);
+                const selection = window.getSelection();
+                selection.removeAllRanges();
+                selection.addRange(range);
+            }");
+            await composer.PressAsync("Enter", new LocatorPressOptions { Timeout = timeout });
+            return true;
+        }
+        catch (Exception ex) when (ex is PlaywrightException || ex is TimeoutException)
+        {
+            _logger.LogWarning("Could not focus the composer and press Enter: {Message}", ex.Message.Split('\n')[0]);
+            return false;
+        }
+    }
+
+    private async Task<int> GetUserMessageCountAsync(IPage page)
+    {
+        foreach (var sel in DefaultUserMessageSelectors)
+        {
+            try
+            {
+                var count = await page.Locator(sel).CountAsync();
+                if (count > 0)
+                    return count;
+            }
+            catch
+            {
+                // Ignored
+            }
+        }
+        return 0;
     }
 
     // data-message-id of the newest M365 reply; "" while that reply is still being written (no id yet); null when
