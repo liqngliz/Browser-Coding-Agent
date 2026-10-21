@@ -407,6 +407,64 @@ public class StreamingCoordinatorTests : IAsyncLifetime
         Assert.Equal(prompt.TrimEnd(), Unwrap(sent)); // messages are trimmed before sending
     }
 
+    // FakeChatPage plus a hook run before load completes (glitches the composer or the page state)
+    private async Task<(RequestCoordinator Coordinator, IPage Page)> CreateGlitchyAsync(string setup)
+    {
+        var page = await _browser!.NewPageAsync();
+        await page.SetContentAsync(FakeChatPage);
+        await page.EvaluateAsync(setup);
+        var options = Options.Create(new ChatOptions { ModelAlias = "m365-active", ResponseTimeoutMinutes = 1 });
+        var adapter = new M365ChatAdapter(options, NullLogger<M365ChatAdapter>.Instance);
+        return (new RequestCoordinator(new PageBrowserSession(page), adapter, options, NullLogger<RequestCoordinator>.Instance), page);
+    }
+
+    private static ChatCompletionRequest LaterTurn(string text) => new("m365-active", new List<ChatMessageRequest?>
+    {
+        new("user", "First"), new("assistant", "Earlier reply"), new("user", text)
+    });
+
+    [Fact]
+    public async Task FirstFillGarbled_IsRetried_AndSentOnce()
+    {
+        var (coordinator, page) = await CreateGlitchyAsync(@"() => {
+            window.inputs = 0;
+            const composer = document.querySelector('textarea');
+            composer.addEventListener('input', () => { if (composer.value && ++window.inputs === 1) composer.value = composer.value + ' (garbled)'; });
+        }");
+
+        var result = await coordinator.ExecuteChatCompletionAsync(LaterTurn("Hello"), new DefaultHttpContext());
+
+        var ok = Assert.IsType<Microsoft.AspNetCore.Http.HttpResults.Ok<ChatCompletionResponse>>(result);
+        Assert.Equal("Alpha beta gamma delta", ok.Value!.Choices[0].Message.Content);
+        Assert.Equal(new[] { "Hello" }, await page.EvaluateAsync<string[]>("window.sent"));
+    }
+
+    [Fact]
+    public async Task LeftoverComposerText_IsClearedInsteadOf503()
+    {
+        var (coordinator, page) = await CreateGlitchyAsync("() => { document.querySelector('textarea').value = 'left over from a failed attempt'; }");
+
+        var result = await coordinator.ExecuteChatCompletionAsync(LaterTurn("Hello"), new DefaultHttpContext());
+
+        Assert.IsType<Microsoft.AspNetCore.Http.HttpResults.Ok<ChatCompletionResponse>>(result);
+        Assert.Equal(new[] { "Hello" }, await page.EvaluateAsync<string[]>("window.sent"));
+    }
+
+    [Fact]
+    public async Task StillGenerating_IsWaitedOutInsteadOf503()
+    {
+        var (coordinator, page) = await CreateGlitchyAsync(@"() => {
+            const stop = document.querySelector(""button[aria-label='Stop generating']"");
+            stop.style.display = 'inline-block';
+            setTimeout(() => { stop.style.display = 'none'; }, 3000);
+        }");
+
+        var result = await coordinator.ExecuteChatCompletionAsync(LaterTurn("Hello"), new DefaultHttpContext());
+
+        Assert.IsType<Microsoft.AspNetCore.Http.HttpResults.Ok<ChatCompletionResponse>>(result);
+        Assert.Equal(new[] { "Hello" }, await page.EvaluateAsync<string[]>("window.sent"));
+    }
+
     [Fact]
     public async Task LaterTurn_SendsOnlyNewMessage_WithoutNewChat()
     {

@@ -26,6 +26,8 @@ public class RequestCoordinator
     private readonly SemaphoreSlim _gate = new(1, 1);
 
     private static readonly TimeSpan KeepAliveInterval = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan ReadinessRecoveryWait = TimeSpan.FromSeconds(60);
+    private const int MaxSubmitAttempts = 3;
 
     public RequestCoordinator(
         IBrowserSession browserSession,
@@ -186,6 +188,12 @@ public class RequestCoordinator
 
             // 4. Browser readiness check
             var (ready, reason) = await _browserSession.CheckReadyAsync(_adapter);
+            if (!ready && _browserSession.ActivePage != null && IsRecoverable(reason))
+            {
+                _logger.LogWarning("Browser not ready ({Reason}); recovering before submitting.", reason);
+                (ready, reason) = await _adapter.RecoverToReadyAsync(_browserSession.ActivePage, ReadinessRecoveryWait, httpContext.RequestAborted);
+            }
+
             if (!ready)
             {
                 return Results.Json(
@@ -463,7 +471,7 @@ public class RequestCoordinator
         {
             try
             {
-                return await _adapter.SendAndObserveAsync(page, prompt, timeout, cancellation, onSendDispatched, onProgress);
+                return await SendWithRetryAsync(page, prompt, Remaining, cancellation, onSendDispatched, onProgress);
             }
             catch (PromptTooLongException tooLong)
             {
@@ -479,13 +487,50 @@ public class RequestCoordinator
         _logger.LogInformation("Sending a {Length}-character prompt in {Parts} parts (limit {Limit}).", prompt.Length, parts.Count, limit);
         for (var i = 0; i < parts.Count - 1; i++)
         {
-            var acknowledgement = await _adapter.SendAndObserveAsync(page, parts[i], Remaining(), cancellation, onSendDispatched);
+            var acknowledgement = await SendWithRetryAsync(page, parts[i], Remaining, cancellation, onSendDispatched, null);
             _logger.LogInformation("Part {Part}/{Total} acknowledged: {Reply}", i + 1, parts.Count,
                 acknowledgement.Length > 80 ? acknowledgement[..80] + "..." : acknowledgement);
         }
 
-        return await _adapter.SendAndObserveAsync(page, parts[^1], Remaining(), cancellation, onSendDispatched, onProgress);
+        return await SendWithRetryAsync(page, parts[^1], Remaining, cancellation, onSendDispatched, onProgress);
     }
+
+    // A failure before the send is confirmed means nothing reached Copilot, so the submission is retried: 2s then 4s
+    // apart, with a page reload before the last attempt. Confirmed sends are never repeated; composer limits
+    // (PromptTooLongException, handled by chunking) and usage limits are not retried here.
+    private async Task<string> SendWithRetryAsync(
+        Microsoft.Playwright.IPage page,
+        string text,
+        Func<TimeSpan> remaining,
+        CancellationToken cancellation,
+        Action onSendDispatched,
+        Func<string, Task>? onProgress)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            var dispatched = false;
+            try
+            {
+                return await _adapter.SendAndObserveAsync(page, text, remaining(), cancellation,
+                    () => { dispatched = true; onSendDispatched(); }, onProgress);
+            }
+            catch (InvalidOperationException ex) when (
+                ex is not PromptTooLongException && !dispatched && attempt < MaxSubmitAttempts && !cancellation.IsCancellationRequested)
+            {
+                _logger.LogWarning("Submission attempt {Attempt}/{MaxAttempts} failed before anything was sent: {Reason} Retrying.",
+                    attempt, MaxSubmitAttempts, ex.Message);
+                await Task.Delay(TimeSpan.FromSeconds(2 * attempt), cancellation);
+                if (attempt == MaxSubmitAttempts - 1)
+                    await _adapter.ReloadAsync(page, cancellation);
+                await _adapter.RecoverToReadyAsync(page, ReadinessRecoveryWait, cancellation);
+            }
+        }
+    }
+
+    private static bool IsRecoverable(string? reason) =>
+        reason != null && (reason.Contains("already contains text", StringComparison.OrdinalIgnoreCase) ||
+                           reason.Contains("currently generating", StringComparison.OrdinalIgnoreCase) ||
+                           reason.Contains("Composer input box is not visible", StringComparison.OrdinalIgnoreCase));
 
     // Comment lines keep proxies and clients from closing an idle stream while M365 is still thinking
     private static async Task KeepAliveAsync(SseChatStream stream, CancellationToken cancellationToken)

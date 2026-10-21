@@ -459,6 +459,54 @@ public class M365ChatAdapter
         }
     }
 
+    // Readiness problems a retry can fix: leftover composer text (an earlier failed attempt) is cleared, an answer
+    // still generating or a composer still loading is waited out. A usage limit returns immediately.
+    public async Task<(bool Ready, string? Reason)> RecoverToReadyAsync(IPage page, TimeSpan maxWait, CancellationToken cancellationToken)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        while (true)
+        {
+            var (ready, reason) = await CheckPageReadyAsync(page);
+            if (ready || stopwatch.Elapsed >= maxWait || reason?.Contains("usage limit", StringComparison.OrdinalIgnoreCase) == true)
+                return (ready, reason);
+
+            if (reason?.Contains("already contains text", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                var (composer, _) = await FindFirstElementAsync(page, GetComposerSelectors(), 1000);
+                if (composer != null)
+                {
+                    _logger.LogWarning("Clearing leftover composer text before submitting.");
+                    await ClearComposerQuietlyAsync(composer);
+                }
+            }
+
+            await Task.Delay(1000, cancellationToken);
+        }
+    }
+
+    // Reload the current chat (the conversation URL keeps its history) to clear a stuck composer or editor
+    public async Task ReloadAsync(IPage page, CancellationToken cancellationToken)
+    {
+        if (!Uri.TryCreate(page.Url, UriKind.Absolute, out var current) ||
+            (current.Scheme != Uri.UriSchemeHttp && current.Scheme != Uri.UriSchemeHttps))
+            return;
+
+        _logger.LogWarning("Reloading {Url} to recover the chat page.", page.Url);
+        try
+        {
+            await page.ReloadAsync(new PageReloadOptions { Timeout = 30000 });
+        }
+        catch (PlaywrightException ex)
+        {
+            _logger.LogWarning("Reload failed: {Message}", ex.Message.Split('\n')[0]);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var (composer, _) = await FindFirstElementAsync(page, GetComposerSelectors(), 30000);
+        if (composer == null)
+            _logger.LogWarning("Composer not visible after reload.");
+    }
+
     public async Task StartNewChatAsync(IPage page, CancellationToken cancellationToken)
     {
         var startedInConversation = IsConversationUrl(page.Url);
