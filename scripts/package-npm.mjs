@@ -17,7 +17,9 @@ const win = process.platform === 'win32';
 fs.rmSync(stage, { recursive: true, force: true });
 fs.mkdirSync(out, { recursive: true });
 fs.cpSync(path.join(repo, 'npm', 'browser-coding-agent'), stage, { recursive: true });
-for (const f of ['README.md', 'LICENSE']) fs.copyFileSync(path.join(repo, f), path.join(stage, f));
+// Package page README: run commands and options only (docs/package-readme.md); the repo README stays on GitHub
+fs.copyFileSync(path.join(repo, 'docs', 'package-readme.md'), path.join(stage, 'README.md'));
+fs.copyFileSync(path.join(repo, 'LICENSE'), path.join(stage, 'LICENSE'));
 
 // UseAppHost=false: an apphost resolves its framework from DOTNET_ROOT or a system install, the private runtime is in neither
 execFileSync('dotnet', ['publish', path.join(repo, 'src', 'BrowserCodingAgent.Api'), '-c', 'Release',
