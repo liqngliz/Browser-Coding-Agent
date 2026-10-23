@@ -56,7 +56,7 @@ public class M365IntegrationTests
 
         var env = new TestHostEnvironment();
         var adapter = new M365ChatAdapter(chatOptions, NullLogger<M365ChatAdapter>.Instance);
-        await using var session = new BrowserSession(browserOptions, env, NullLogger<BrowserSession>.Instance);
+        await using var session = new BrowserSession(browserOptions, chatOptions, env, NullLogger<BrowserSession>.Instance);
 
         await session.StartAsync();
         Assert.NotNull(session.ActivePage);

@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using BrowserCodingAgent.Api.Providers;
 using BrowserCodingAgent.Api.Services;
 
 namespace BrowserCodingAgent.Api.Configuration;
@@ -12,8 +13,8 @@ public class BrowserOptions
 
     public string? UserDataDirectory { get; set; }
 
-    [Required(AllowEmptyStrings = false)]
-    public string StartUrl { get; set; } = "https://m365.cloud.microsoft/chat";
+    // Unset = the provider's chat page (ChatSite.StartUrl)
+    public string? StartUrl { get; set; }
 
     public bool Headless { get; set; } = false;
     public bool AutoStart { get; set; } = true;
@@ -24,21 +25,23 @@ public class BrowserOptions
         if (ch != "chrome" && ch != "msedge")
             throw new InvalidOperationException($"Invalid Browser:Channel '{Channel}'. Must be 'chrome' or 'msedge'.");
 
-        if (string.IsNullOrWhiteSpace(StartUrl) || !Uri.TryCreate(StartUrl, UriKind.Absolute, out var uri) ||
-            (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+        if (StartUrl != null && (!Uri.TryCreate(StartUrl, UriKind.Absolute, out var uri) ||
+            (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)))
         {
             throw new InvalidOperationException($"Invalid Browser:StartUrl '{StartUrl}'. Must be an absolute HTTP or HTTPS URL.");
         }
     }
 
-    public string ResolveUserDataDirectory(string contentRoot)
+    public string ResolveStartUrl(ChatSite site) => string.IsNullOrWhiteSpace(StartUrl) ? site.StartUrl : StartUrl;
+
+    public string ResolveUserDataDirectory(string contentRoot, ChatSite site)
     {
         var channelName = string.IsNullOrWhiteSpace(Channel) ? "chrome" : Channel.Trim().ToLowerInvariant();
 
         if (string.IsNullOrWhiteSpace(UserDataDirectory))
         {
             var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            return Path.Combine(home, ".browser-coding-agent", "profiles", channelName);
+            return Path.Combine(home, ".browser-coding-agent", "profiles", site.ProfileName(channelName));
         }
 
         var path = UserDataDirectory;
@@ -60,8 +63,17 @@ public class ChatOptions
 {
     public const string SectionName = "Chat";
 
-    [Required(AllowEmptyStrings = false)]
-    public string ModelAlias { get; set; } = "m365-active";
+    // Chat site: m365 (default) or gemini
+    public string? Provider { get; set; }
+
+    private string? _modelAlias;
+
+    // Unset = the provider's alias (m365-active, gemini-active)
+    public string ModelAlias
+    {
+        get => string.IsNullOrWhiteSpace(_modelAlias) ? ChatSite.Get(Provider).ModelAlias : _modelAlias;
+        set => _modelAlias = value;
+    }
 
     [Range(1, 120)]
     public int ResponseTimeoutMinutes { get; set; } = 10;
@@ -85,8 +97,7 @@ public class ChatOptions
 
     public void Validate()
     {
-        if (string.IsNullOrWhiteSpace(ModelAlias))
-            throw new InvalidOperationException("Chat:ModelAlias cannot be empty.");
+        ChatSite.Get(Provider); // throws on an unknown provider
 
         if (MaxPromptChars != 0 && MaxPromptChars < PromptChunker.MinChunkChars)
             throw new InvalidOperationException($"Chat:MaxPromptChars must be 0 or at least {PromptChunker.MinChunkChars}. Got {MaxPromptChars}.");

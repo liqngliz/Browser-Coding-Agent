@@ -380,7 +380,7 @@ public class RequestCoordinator
                 if (CurrentState == ChatTurnState.Generating)
                 {
                     CurrentState = ChatTurnState.UncertainRecoveryRequired;
-                    RecoveryReason = $"Upstream Copilot error: {uex.Message}.";
+                    RecoveryReason = $"Upstream {_adapter.Site.DisplayName} error: {uex.Message}.";
                 }
                 else
                 {
@@ -390,7 +390,7 @@ public class RequestCoordinator
                 _logger.LogError(uex, "Upstream UI reported error: {Message}", uex.Message);
                 return await Fail(StatusCodes.Status502BadGateway,
                     new ErrorResponse(new ErrorDetail(
-                        $"Upstream error from Copilot UI: {uex.Message}",
+                        $"Upstream error from {_adapter.Site.DisplayName} UI: {uex.Message}",
                         "api_error",
                         null,
                         "upstream_error")));

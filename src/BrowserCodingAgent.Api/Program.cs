@@ -137,7 +137,7 @@ app.MapPost("/v1/chat/completions", async (
     return await coordinator.ExecuteChatCompletionAsync(request, httpContext);
 })
     .WithTags("OpenAI")
-    .WithSummary("Send one user message to M365 Copilot and return the completed answer")
+    .WithSummary("Send one user message to the web chat and return the completed answer")
     .Produces<ChatCompletionResponse>()
     .Produces<ErrorResponse>(StatusCodes.Status400BadRequest)
     .Produces<ErrorResponse>(StatusCodes.Status409Conflict)

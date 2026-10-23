@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using BrowserCodingAgent.Api.Configuration;
+using BrowserCodingAgent.Api.Providers;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.Playwright;
@@ -30,13 +31,11 @@ public class M365ChatAdapter
     private readonly ChatOptions _chatOptions;
     private readonly ILogger<M365ChatAdapter> _logger;
 
-    private const string M365ComposerSelector = "#m365-chat-editor-target-element";
-    private const string M365ReplySelector = "[data-testid='markdown-reply']";
+    private readonly ChatSite _site;
 
-    private static readonly string[] DefaultComposerSelectors =
+    // Generic fallbacks after the site's own selectors (other pages, simulated tests)
+    private static readonly string[] GenericComposerSelectors =
     {
-        M365ComposerSelector,
-        "[contenteditable='true'][aria-label='Message Copilot']",
         "textarea[placeholder*='Ask']",
         "textarea[placeholder*='Copilot']",
         "textarea#userInput",
@@ -47,7 +46,7 @@ public class M365ChatAdapter
         "textarea"
     };
 
-    private static readonly string[] DefaultSendButtonSelectors =
+    private static readonly string[] GenericSendButtonSelectors =
     {
         "button[aria-label='Submit message']",
         "button[aria-label='Send']",
@@ -57,7 +56,7 @@ public class M365ChatAdapter
         "button[data-testid*='send']"
     };
 
-    private static readonly string[] DefaultStopGeneratingSelectors =
+    private static readonly string[] GenericStopGeneratingSelectors =
     {
         "button[aria-label='Stop generating']",
         "button[aria-label='Stop responding']",
@@ -67,9 +66,8 @@ public class M365ChatAdapter
         "[data-testid*='stop-generating']"
     };
 
-    private static readonly string[] DefaultAssistantMessageSelectors =
+    private static readonly string[] GenericAssistantMessageSelectors =
     {
-        M365ReplySelector,
         "[data-message-author='assistant']",
         "[data-message-author='bot']",
         "[data-author='assistant']",
@@ -80,9 +78,8 @@ public class M365ChatAdapter
         ".fui-ChatMessage[data-message-author='assistant']"
     };
 
-    private static readonly string[] DefaultUserMessageSelectors =
+    private static readonly string[] GenericUserMessageSelectors =
     {
-        "[data-testid='chatQuestion']",
         "[data-message-author='user']",
         "[data-content='user-message']",
         "div[data-testid*='user-message']",
@@ -118,7 +115,10 @@ public class M365ChatAdapter
     {
         _chatOptions = chatOptions.Value;
         _logger = logger;
+        _site = ChatSite.Get(_chatOptions.Provider);
     }
+
+    public ChatSite Site => _site;
 
     public async Task<(bool Ready, string? Reason)> CheckPageReadyAsync(IPage page)
     {
@@ -136,7 +136,20 @@ public class M365ChatAdapter
 
         var usageLimit = await FindUsageLimitNoticeAsync(page);
         if (usageLimit != null)
-            return (false, $"Copilot usage limit reached: {usageLimit}");
+            return (false, $"{_site.DisplayName} usage limit reached: {usageLimit}");
+
+        if (_site.SignedOutScript != null)
+        {
+            try
+            {
+                if (await page.EvaluateAsync<bool>(_site.SignedOutScript))
+                    return (false, "Sign-in required in browser window.");
+            }
+            catch
+            {
+                // Page navigating; the next readiness check decides
+            }
+        }
 
         return (true, null);
     }
@@ -342,6 +355,7 @@ public class M365ChatAdapter
         string? lastObservedText = null;
         var stableCount = 0;
         var observed = "no poll completed";
+        var cancellationLogged = false;
 
         TimeoutException AnswerTimeout() => new(
             $"Response timeout of {timeout.TotalMinutes} minutes exceeded waiting for assistant answer (last observed: {observed}).");
@@ -368,7 +382,7 @@ public class M365ChatAdapter
 
             var usageLimit = await FindUsageLimitNoticeAsync(page);
             if (usageLimit != null)
-                throw new UpstreamUiException($"Copilot usage limit reached: {usageLimit}");
+                throw new UpstreamUiException($"{_site.DisplayName} usage limit reached: {usageLimit}");
 
             // Check for UI error banner
             var (errorElement, _) = await FindFirstElementAsync(page, GetErrorBannerSelectors(), Math.Min(100, (float)remaining.TotalMilliseconds));
@@ -438,6 +452,10 @@ public class M365ChatAdapter
                     var isUiIdle = isSendEnabled || (isComposerReady && isComposerEmpty);
                     if (generationSeen && !isGenerating && isUiIdle && stableCount >= 1)
                     {
+                        if (_site.ErrorReplyPattern != null &&
+                            System.Text.RegularExpressions.Regex.IsMatch(latestText.Trim(), _site.ErrorReplyPattern))
+                            throw new UpstreamUiException($"{_site.DisplayName} replied with an error: {latestText.Trim()}");
+
                         _logger.LogInformation("Answer collection completed successfully.");
                         return latestText;
                     }
@@ -458,7 +476,9 @@ public class M365ChatAdapter
             }
             catch (OperationCanceledException) when (clientCancellation.IsCancellationRequested)
             {
-                _logger.LogWarning("Client cancelled request wait after submission. Observing browser until turn completes within remaining budget.");
+                if (!cancellationLogged)
+                    _logger.LogWarning("Client cancelled request wait after submission. Observing browser until turn completes within remaining budget.");
+                cancellationLogged = true;
                 await Task.Delay(delayMs, CancellationToken.None);
             }
 
@@ -570,20 +590,20 @@ public class M365ChatAdapter
     private IEnumerable<string> GetComposerSelectors() =>
         !string.IsNullOrWhiteSpace(_chatOptions.ComposerSelector)
             ? new[] { _chatOptions.ComposerSelector }
-            : DefaultComposerSelectors;
+            : _site.ComposerSelectors.Concat(GenericComposerSelectors);
 
     private IEnumerable<string> GetSendButtonSelectors() =>
         !string.IsNullOrWhiteSpace(_chatOptions.SendButtonSelector)
             ? new[] { _chatOptions.SendButtonSelector }
-            : DefaultSendButtonSelectors;
+            : _site.SendSelectors.Concat(GenericSendButtonSelectors);
 
     private IEnumerable<string> GetStopGeneratingSelectors() =>
         !string.IsNullOrWhiteSpace(_chatOptions.StopGeneratingSelector)
             ? new[] { _chatOptions.StopGeneratingSelector }
-            : DefaultStopGeneratingSelectors;
+            : _site.StopSelectors.Concat(GenericStopGeneratingSelectors);
 
-    // On the real M365 page only markdown-reply is the answer: broader defaults also match the message container
-    // (hidden "Copilot said:" heading, "Gathering details…" placeholder) before markdown-reply exists
+    // On the real site only its reply element is the answer: broader fallbacks also match the message container
+    // (M365's hidden "Copilot said:" heading, "Gathering details…" placeholder) before the reply element exists
     private async Task<IEnumerable<string>> GetAssistantMessageSelectorsAsync(IPage page)
     {
         if (!string.IsNullOrWhiteSpace(_chatOptions.AssistantMessageSelector))
@@ -591,22 +611,23 @@ public class M365ChatAdapter
 
         try
         {
-            if (await page.Locator(M365ComposerSelector).CountAsync() > 0)
-                return new[] { M365ReplySelector };
+            if (await page.Locator(_site.ComposerSelector).CountAsync() > 0)
+                return new[] { _site.ReplySelector };
         }
         catch
         {
             // Fall back to the default list
         }
 
-        return DefaultAssistantMessageSelectors;
+        return new[] { _site.ReplySelector }.Concat(GenericAssistantMessageSelectors);
     }
 
     private IEnumerable<string> GetErrorBannerSelectors() => DefaultErrorBannerSelectors;
 
-    private static bool IsConversationUrl(string url) =>
+    private bool IsConversationUrl(string url) =>
         Uri.TryCreate(url, UriKind.Absolute, out var uri) &&
-        uri.AbsolutePath.Contains("/conversation/", StringComparison.OrdinalIgnoreCase);
+        System.Text.RegularExpressions.Regex.IsMatch(uri.AbsolutePath, _site.ConversationPathPattern,
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
     private static bool IsSamePage(string fromUrl, string toUrl) =>
         Uri.TryCreate(fromUrl, UriKind.Absolute, out var from) &&
@@ -614,15 +635,15 @@ public class M365ChatAdapter
         string.Equals(from.Host, to.Host, StringComparison.OrdinalIgnoreCase) &&
         string.Equals(from.AbsolutePath.TrimEnd('/'), to.AbsolutePath.TrimEnd('/'), StringComparison.OrdinalIgnoreCase);
 
-    private static bool IsNewConversationNavigation(string fromUrl, string toUrl)
+    // First turn of a new chat: M365 /chat -> /chat/conversation/{id}, Gemini /app -> /app/{id}
+    private bool IsNewConversationNavigation(string fromUrl, string toUrl)
     {
         if (!Uri.TryCreate(fromUrl, UriKind.Absolute, out var from) ||
             !Uri.TryCreate(toUrl, UriKind.Absolute, out var to))
             return false;
 
         return string.Equals(from.Host, to.Host, StringComparison.OrdinalIgnoreCase) &&
-               !from.AbsolutePath.Contains("/conversation/", StringComparison.OrdinalIgnoreCase) &&
-               to.AbsolutePath.Contains("/conversation/", StringComparison.OrdinalIgnoreCase);
+               !IsConversationUrl(fromUrl) && IsConversationUrl(toUrl);
     }
 
     // The M365 editor appends zero-width markers (U+200B, U+200C) after typed text
@@ -689,8 +710,23 @@ public class M365ChatAdapter
         return (null, null);
     }
 
-    private static async Task<string> GetComposerTextAsync(ILocator composer, float timeoutMs = 500)
+    private async Task<string> GetComposerTextAsync(ILocator composer, float timeoutMs = 500)
     {
+        if (_site.ComposerReadScript != null)
+        {
+            try
+            {
+                var siteText = await composer.EvaluateAsync<string?>(_site.ComposerReadScript, null,
+                    new LocatorEvaluateOptions { Timeout = timeoutMs });
+                if (siteText != null)
+                    return NormalizeComposerText(siteText);
+            }
+            catch
+            {
+                // Fall back to value/innerText
+            }
+        }
+
         try
         {
             var val = await composer.InputValueAsync(new LocatorInputValueOptions { Timeout = timeoutMs });
@@ -789,7 +825,7 @@ public class M365ChatAdapter
 
     private async Task<int> GetUserMessageCountAsync(IPage page)
     {
-        foreach (var sel in DefaultUserMessageSelectors)
+        foreach (var sel in _site.UserMessageSelectors.Concat(GenericUserMessageSelectors))
         {
             try
             {
@@ -805,18 +841,18 @@ public class M365ChatAdapter
         return 0;
     }
 
-    // data-message-id of the newest M365 reply; "" while that reply is still being written (no id yet); null when
+    // Id of the newest reply (M365 data-message-id, Gemini message-content id); "" while it has none yet; null when
     // the page has no replies or does not expose reply ids (then reply counting is used)
-    private static async Task<string?> GetLatestReplyIdAsync(IPage page)
+    private async Task<string?> GetLatestReplyIdAsync(IPage page)
     {
         try
         {
-            return await page.EvaluateAsync<string?>(@"() => {
-                const replies = document.querySelectorAll(""[data-testid='markdown-reply']"");
+            return await page.EvaluateAsync<string?>(@"([selector, attribute]) => {
+                const replies = document.querySelectorAll(selector);
                 if (!replies.length) return null;
-                const id = replies[replies.length - 1].getAttribute('data-message-id');
+                const id = replies[replies.length - 1].getAttribute(attribute);
                 return id === null ? '' : id;
-            }");
+            }", new[] { _site.ReplySelector, _site.ReplyIdAttribute });
         }
         catch
         {
@@ -852,7 +888,7 @@ public class M365ChatAdapter
             return await page.EvaluateAsync<string?>(@"() => {
                 for (const el of document.querySelectorAll(""[role='status'], [role='alert']"")) {
                     const text = (el.innerText || '').trim();
-                    if (/reached your (daily|usage) limit/i.test(text)) return text.replace(/\s+/g, ' ');
+                    if (/reached your (daily |usage )?limit/i.test(text)) return text.replace(/\s+/g, ' ');
                 }
                 return null;
             }");
@@ -863,14 +899,14 @@ public class M365ChatAdapter
         }
     }
 
-    private static async Task<bool> IsLatestReplyFinalizedAsync(IPage page)
+    private async Task<bool> IsLatestReplyFinalizedAsync(IPage page)
     {
         try
         {
-            return await page.EvaluateAsync<bool>(@"() => {
-                const replies = document.querySelectorAll(""[data-testid='markdown-reply']"");
-                return replies.length > 0 && replies[replies.length - 1].getAttribute('aria-hidden') === 'false';
-            }");
+            return await page.EvaluateAsync<bool>(@"([selector, finished]) => {
+                const replies = document.querySelectorAll(selector);
+                return replies.length > 0 && !!(new Function('return ' + finished))()(replies[replies.length - 1]);
+            }", new[] { _site.ReplySelector, _site.ReplyFinishedScript });
         }
         catch
         {
@@ -892,17 +928,20 @@ public class M365ChatAdapter
                     // Extract text preserving markdown code blocks, paragraphs, and list items
                     try
                     {
-                        // M365 renders code as Fluent components, not <pre>: a language label (unknown languages show as
-                        // 'Shell'), an 'isn't fully supported' notice, buttons, and a role=textbox 'Code editor'. Code text is read
-                        // from the live element, where innerText keeps line breaks, then the clone's block becomes a fence.
-                        var extracted = await last.EvaluateAsync<string>(@"el => {
-                            const codeBlockSelector = ""[role='group'][aria-label='Code Preview'], .scriptor-component-code-block"";
+                        // Sites render code as components, not bare <pre>: a language label, buttons, notices, and the code
+                        // element (ChatSite.CodeBlocks). Code text is read from the live element, where innerText keeps
+                        // line breaks, then the clone's block becomes a fence; generic labels ("Code snippet") give no language.
+                        var markup = _site.CodeBlocks;
+                        var extracted = await last.EvaluateAsync<string>(@"(el, m) => {
+                            const codeBlockSelector = m.container;
                             const outermost = root => [...root.querySelectorAll(codeBlockSelector)]
                                 .filter(b => !b.parentElement.closest(codeBlockSelector));
                             const fences = outermost(el).map(block => {
-                                const label = block.querySelector(""[data-testid='one-copilot-code-identity']"");
-                                const lang = (label ? label.innerText : '').trim().toLowerCase().replace(/[^\w-]/g, '');
-                                const editor = block.querySelector(""[role='textbox'][aria-label='Code editor']"");
+                                const label = block.querySelector(m.label);
+                                let lang = (label ? label.innerText : '').trim().toLowerCase();
+                                if (m.genericLabels.includes(lang)) lang = '';
+                                lang = lang.replace(/[^\w-]/g, '');
+                                const editor = block.querySelector(m.code);
                                 const code = editor ? editor.innerText : '';
                                 return '\n```' + lang + '\n' + code.replace(/ /g, ' ').trimEnd() + '\n```\n';
                             });
@@ -921,7 +960,7 @@ public class M365ChatAdapter
                                 br.replaceWith(document.createTextNode('\n'));
                             });
                             return (clone.textContent || '').trim();
-                        }");
+                        }", new { container = markup.Container, label = markup.Label, code = markup.Code, genericLabels = markup.GenericLabels });
 
                         if (!string.IsNullOrWhiteSpace(extracted))
                             return extracted;

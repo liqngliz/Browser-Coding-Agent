@@ -1,4 +1,5 @@
 using BrowserCodingAgent.Api.Configuration;
+using BrowserCodingAgent.Api.Providers;
 using BrowserCodingAgent.Api.Providers.M365;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -20,6 +21,7 @@ public interface IBrowserSession : IAsyncDisposable
 public class BrowserSession : IBrowserSession, IHostedService
 {
     private readonly BrowserOptions _browserOptions;
+    private readonly ChatSite _site;
     private readonly IHostEnvironment _environment;
     private readonly ILogger<BrowserSession> _logger;
     private readonly SemaphoreSlim _initLock = new(1, 1);
@@ -35,10 +37,12 @@ public class BrowserSession : IBrowserSession, IHostedService
 
     public BrowserSession(
         IOptions<BrowserOptions> browserOptions,
+        IOptions<ChatOptions> chatOptions,
         IHostEnvironment environment,
         ILogger<BrowserSession> logger)
     {
         _browserOptions = browserOptions.Value;
+        _site = ChatSite.Get(chatOptions.Value.Provider);
         _environment = environment;
         _logger = logger;
     }
@@ -72,14 +76,15 @@ public class BrowserSession : IBrowserSession, IHostedService
             _logger.LogInformation("Launching browser channel: {Channel}", _browserOptions.Channel);
             _playwright ??= await Playwright.CreateAsync();
 
-            var userDataDir = _browserOptions.ResolveUserDataDirectory(_environment.ContentRootPath);
+            var userDataDir = _browserOptions.ResolveUserDataDirectory(_environment.ContentRootPath, _site);
             Directory.CreateDirectory(userDataDir);
 
             var options = new BrowserTypeLaunchPersistentContextOptions
             {
                 Headless = _browserOptions.Headless,
                 Channel = string.IsNullOrWhiteSpace(_browserOptions.Channel) ? null : _browserOptions.Channel,
-                Args = new[] { "--disable-blink-features=AutomationControlled" }
+                Args = new[] { "--disable-blink-features=AutomationControlled" },
+                IgnoreDefaultArgs = _site.LaunchWithoutAutomationFlag ? new[] { "--enable-automation" } : null
             };
 
             _context = await LaunchPersistentContextAsync(_playwright, userDataDir, options, cancellationToken);
@@ -119,17 +124,17 @@ public class BrowserSession : IBrowserSession, IHostedService
             else
             {
                 _activePage = _context.Pages.Count > 0 ? _context.Pages[0] : await _context.NewPageAsync();
-                if (!string.IsNullOrWhiteSpace(_browserOptions.StartUrl) &&
+                if (!string.IsNullOrWhiteSpace(StartUrl) &&
                     (_activePage.Url == "about:blank" || string.IsNullOrEmpty(_activePage.Url)))
                 {
-                    _logger.LogInformation("Navigating to start URL: {StartUrl}", _browserOptions.StartUrl);
+                    _logger.LogInformation("Navigating to start URL: {StartUrl}", StartUrl);
                     try
                     {
-                        await _activePage.GotoAsync(_browserOptions.StartUrl, new PageGotoOptions { Timeout = 30000 });
+                        await _activePage.GotoAsync(StartUrl, new PageGotoOptions { Timeout = 30000 });
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogWarning(ex, "Failed initial navigation to {StartUrl}", _browserOptions.StartUrl);
+                        _logger.LogWarning(ex, "Failed initial navigation to {StartUrl}", StartUrl);
                         LastError = ex.Message;
                     }
                 }
@@ -170,10 +175,7 @@ public class BrowserSession : IBrowserSession, IHostedService
             }
             else
             {
-                var loginPage = _context.Pages.FirstOrDefault(p =>
-                    !p.IsClosed && (p.Url.Contains("login.microsoftonline.com", StringComparison.OrdinalIgnoreCase) ||
-                                   p.Url.Contains("/oauth2/", StringComparison.OrdinalIgnoreCase) ||
-                                   p.Url.Contains("signin", StringComparison.OrdinalIgnoreCase)));
+                var loginPage = _context.Pages.FirstOrDefault(p => !p.IsClosed && IsSignInUrl(p.Url));
                 if (loginPage != null)
                 {
                     _activePage = loginPage;
@@ -185,9 +187,7 @@ public class BrowserSession : IBrowserSession, IHostedService
         }
 
         var url = _activePage.Url;
-        if (url.Contains("login.microsoftonline.com", StringComparison.OrdinalIgnoreCase) ||
-            url.Contains("/oauth2/", StringComparison.OrdinalIgnoreCase) ||
-            url.Contains("signin", StringComparison.OrdinalIgnoreCase))
+        if (IsSignInUrl(url))
         {
             return (false, "Sign-in required in browser window.");
         }
@@ -294,10 +294,14 @@ public class BrowserSession : IBrowserSession, IHostedService
                "or set Browser:UserDataDirectory to a different profile.";
     }
 
-    private string GetTargetHost()
-    {
-        if (Uri.TryCreate(_browserOptions.StartUrl, UriKind.Absolute, out var uri))
-            return uri.Host;
-        return "m365.cloud.microsoft";
-    }
+    private static bool IsSignInUrl(string url) =>
+        url.Contains("login.microsoftonline.com", StringComparison.OrdinalIgnoreCase) ||
+        url.Contains("accounts.google.com", StringComparison.OrdinalIgnoreCase) ||
+        url.Contains("/oauth2/", StringComparison.OrdinalIgnoreCase) ||
+        url.Contains("signin", StringComparison.OrdinalIgnoreCase);
+
+    private string StartUrl => _browserOptions.ResolveStartUrl(_site);
+
+    private string GetTargetHost() =>
+        Uri.TryCreate(StartUrl, UriKind.Absolute, out var uri) ? uri.Host : new Uri(_site.StartUrl).Host;
 }

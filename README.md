@@ -1,6 +1,6 @@
 # Browser-Coding-Agent
 
-A .NET 10 Minimal API server exposing an OpenAI-compatible chat completions interface backed by Microsoft 365 Copilot web chat via Playwright for .NET.
+A .NET 10 Minimal API server exposing an OpenAI-compatible chat completions interface backed by Microsoft 365 Copilot or Google Gemini web chat via Playwright for .NET.
 
 The server opens a visible, standalone Microsoft Edge or Google Chrome window. Sign in manually and select your desired model and chat session in that window. Automation enters the prompt, clicks Send once, observes generation, and extracts the completed assistant response.
 
@@ -81,15 +81,38 @@ Default `appsettings.json`:
 ```json
 {
   "Browser": {
-    "Channel": "chrome",
-    "StartUrl": "https://m365.cloud.microsoft/chat"
+    "Channel": "chrome"
   },
   "Chat": {
-    "ModelAlias": "m365-active",
+    "Provider": "m365",
     "ResponseTimeoutMinutes": 10
   }
 }
 ```
+
+### Chat sites
+
+`Chat:Provider` picks the web chat; the other settings default per site.
+
+| `Chat:Provider` | Start URL | Model alias | Profile (`~/.browser-coding-agent/profiles/`) | Sign-in |
+| --- | --- | --- | --- | --- |
+| `m365` (default) | `https://m365.cloud.microsoft/chat` | `m365-active` | `<channel>` | Microsoft work account |
+| `gemini` | `https://gemini.google.com/app` | `gemini-active` | `gemini-<channel>` | Google account; launched without `--enable-automation` so Google accepts the sign-in |
+
+Override with `Browser:StartUrl`, `Chat:ModelAlias`, `Browser:UserDataDirectory`. Gemini signed out (page usable, "Sign in" button shown) reports not ready.
+
+### Context window (Cline, OpenCode)
+
+The web chat keeps the whole conversation; each turn sends only the new messages, so client-side compaction does not shrink what the chat holds. Cline's default for OpenAI Compatible is 128,000 tokens.
+
+| Site | Published limit | Client setting |
+| --- | --- | --- |
+| M365 Copilot | none; "this conversation has reached its limit" appears after a long chat | `1000000`; start a new task when the chat refuses |
+| Gemini free | 32,000 tokens | `32000` |
+| Gemini, Google AI Plus | 128,000 tokens | `128000` |
+| Gemini, AI Pro / Ultra | 1,000,000 tokens | `1000000` |
+
+Gemini figures: https://support.google.com/gemini/answer/16275805
 
 ### Prompt replacements
 
@@ -103,7 +126,7 @@ Default `appsettings.json`:
 
 Lookup order: `Chat:ReplacementsFile` -> `~/.browser-coding-agent/replacements.json` -> bundled default (`src/BrowserCodingAgent.Api/replacements.json`). Restart to reload. Startup fails on invalid JSON or regex.
 
-Persistent profiles default to `~/.browser-coding-agent/profiles/<channel>` outside package caches, keeping manual sign-in between restarts. Override with `Browser:UserDataDirectory` if desired.
+Persistent profiles default to `~/.browser-coding-agent/profiles/<channel>` (`gemini-<channel>` for Gemini) outside package caches, keeping manual sign-in between restarts. Override with `Browser:UserDataDirectory` if desired.
 
 ## Endpoints
 
@@ -118,7 +141,7 @@ Persistent profiles default to `~/.browser-coding-agent/profiles/<channel>` outs
 
 ## Supported API subset and limitations
 
-- **Model:** Must match configured `Chat:ModelAlias` (`m365-active`).
+- **Model:** Must match configured `Chat:ModelAlias` (`m365-active`, `gemini-active`).
 - **Messages:** roles `system`, `developer`, `user`, `assistant`, `tool`. Roll-forward mapping onto the M365 tab:
   - no `assistant` message yet (first turn) -> new M365 chat, prompt = system text + user message, joined by blank lines
   - otherwise -> only the messages after the last `assistant` message (`user` and `tool` content, joined by blank lines)
